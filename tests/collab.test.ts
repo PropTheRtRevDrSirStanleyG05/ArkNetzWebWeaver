@@ -7,6 +7,7 @@ import type { BlockNode } from "../src/lib/types.js";
 import {
   COLLAB_STATE_VERSION,
   PEER_EXPIRY_MS,
+  PEER_PRUNE_AFTER_MS,
   colourForLogin,
   describeConflict,
   parseCollabStateFile,
@@ -239,7 +240,7 @@ test("diffBlocks produces upserts for new/changed blocks and deletes for removed
   assert.equal(diffBlocks(prev, [block("b1", "Hello", "h1"), block("b2", "Body")], "alice", 1000, new Map(), counter).length, 0);
 });
 
-test("presence: join, heartbeat refresh, leave, and 30 s expiry", () => {
+test("presence: join, heartbeat refresh, leave, 30 s stale marking, and 5-minute prune", () => {
   let now = 1_000_000;
   const reg = new PresenceRegistry(() => now);
   reg.seen({ login: "alice", heartbeatAt: now, cursor: null });
@@ -259,6 +260,12 @@ test("presence: join, heartbeat refresh, leave, and 30 s expiry", () => {
   assert.equal(reg.leave("alice"), true);
   assert.equal(reg.leave("alice"), false);
   assert.equal(reg.size, 1);
+  // D1 correction (fix pass 2): a peer stale for only ~30 s is NOT
+  // pruned — it stays listed as "(away)" until the 5-minute window
+  // expires. Only then does pruneStale() drop it.
+  assert.deepEqual(reg.pruneStale(), [], "a peer stale ~30 s stays listed, marked (away)");
+  assert.equal(reg.size, 1);
+  now += PEER_PRUNE_AFTER_MS;
   assert.deepEqual(reg.pruneStale(), ["bob"]);
   assert.equal(reg.size, 0);
 });

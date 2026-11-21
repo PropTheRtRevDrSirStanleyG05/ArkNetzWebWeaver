@@ -191,3 +191,29 @@ test("shell: panels are a full-width strip above the reader, status below the to
   assert.match(css, /\.an-toolbar\{[^}]*flex-wrap:wrap/);
   assert.match(css, /overflow-x:hidden/);
 });
+
+// Fix pass 2 (visual defects, hunt 2): the CSS pins for H1/L7/L8/L9/L10.
+test("shell: fix-pass-2 CSS — slash row wraps, editor status is its own row, code has a scroll fade, pill wraps, import URL is wide", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+  // H1: the block-inserter row wraps instead of running off-viewport
+  // at 390px; the input shrinks and the select/buttons wrap with it.
+  assert.match(css, /\.an-slash-row\{[^}]*flex-wrap:wrap/);
+  assert.match(css, /\.an-slash-row input\{[^}]*min-width:0/);
+  // L7: the editor status is a full-width row of its own at the foot
+  // of the bar, never a squeezed mid-header column.
+  assert.match(css, /\.an-editor-bar #editor-status\{flex:1 1 100%;order:99/);
+  // L8: code blocks carry a fade at the clipped edge, signalling the
+  // sideways scroll (reader + editor canvas).
+  assert.match(css, /\.an-reader pre\{[^}]*mask-image:linear-gradient\(to right,#000 calc\(100% - 28px\),transparent 100%\)/);
+  assert.match(css, /pre\.an-ed-text\{[^}]*mask-image:linear-gradient\(to right,#000 calc\(100% - 28px\),transparent 100%\)/);
+  // L9: the account pill wraps cleanly at 390px instead of truncating
+  // mid-name (the #guest-badge nowrap rule above is untouched — that
+  // element no longer exists in the shell; the live badge is the pill).
+  assert.match(css, /#account-pill\{white-space:normal;text-align:left;overflow-wrap:break-word/);
+  // L10: the Import-URL label takes a wide flex share and its input
+  // fills it, at desktop and mobile.
+  assert.match(html, /<label class="an-file-label an-url-label">Import HTML from URL/);
+  assert.match(css, /\.an-editor-bar \.an-url-label\{flex:1 1 320px;min-width:200px\}/);
+  assert.match(css, /\.an-editor-bar #html-import-url\{width:100%;min-width:0\}/);
+});

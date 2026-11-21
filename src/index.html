@@ -11,7 +11,8 @@
 <header class="an-topbar">
   <div class="an-brand">ArkNetzWebWeaver</div>
   <div class="an-account" id="account-area">
-    <span id="guest-badge" title="Anonymous guest browsing — reading needs no sign-in">Guest</span>
+    <button id="account-pill" type="button" aria-haspopup="true" aria-expanded="false" title="Switch account — shows the active account, or Guest when signed out">Guest</button>
+    <div id="account-menu" class="an-account-menu" hidden></div>
     <button id="signin-btn" type="button">Sign in with GitHub</button>
   </div>
 </header>
@@ -97,7 +98,7 @@
       <button id="export-btn" type="button">Export .zip</button>
       <label class="an-file-label">Import WordPress (.xml) <input id="wxr-input" type="file" accept=".xml,text/xml"></label>
       <label class="an-file-label">Import HTML (.html) <input id="html-import-input" type="file" accept=".html,text/html"></label>
-      <label class="an-file-label">Import HTML from URL <input id="html-import-url" type="text" placeholder="https://…/page.html"></label>
+      <label class="an-file-label an-url-label">Import HTML from URL <input id="html-import-url" type="text" placeholder="https://…/page.html"></label>
       <button id="html-import-url-btn" type="button">Import URL</button>
     </div>
     <div id="diff-output" aria-live="polite"></div>

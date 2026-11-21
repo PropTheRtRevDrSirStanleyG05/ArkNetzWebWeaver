@@ -1,11 +1,17 @@
 // ArkNetzWebWeaver — collab presence: who is in this site now.
 // A peer joins by writing their state file (see relay.ts) and stays
-// present by heartbeating. A peer gone >30 s (PEER_EXPIRY_MS) drops
-// from the live presence list — but their blocks stay in the document,
-// marked stale, and when they return they re-sync from the relay.
-// Pure logic, injectable clock: tests drive time by hand.
+// present by heartbeating. The sync engine removes a peer from this
+// registry on its poll in exactly two cases: at once when the peer's
+// relay state file is gone (a graceful leave deletes it — `leave()`),
+// and by pruning when the peer has been silent past
+// PEER_PRUNE_AFTER_MS (`expire()` marks them stale at PEER_EXPIRY_MS
+// first — they stay listed as "(away)" with their blocks marked —
+// and `pruneStale()` drops them only after the 5-minute window).
+// Their blocks stay in the document either way, and when they return
+// they re-sync from the relay. Pure logic, injectable clock: tests
+// drive time by hand.
 
-import { PEER_EXPIRY_MS, colourForLogin } from "./types.js";
+import { PEER_EXPIRY_MS, PEER_PRUNE_AFTER_MS, colourForLogin } from "./types.js";
 import type { CollabPeer, CursorPosition } from "./types.js";
 
 export interface PresenceUpdate {
@@ -52,7 +58,7 @@ export class PresenceRegistry {
   /** Recompute staleness against the clock. Returns the logins that
    *  flipped live -> stale in this call. Stale peers are NOT removed:
    *  their blocks stay, marked stale, until they return or the
-   *  session ends. */
+   *  prune window (PEER_PRUNE_AFTER_MS) expires. */
   expire(): string[] {
     const now = this.now();
     const flipped: string[] = [];
@@ -64,13 +70,17 @@ export class PresenceRegistry {
     return flipped;
   }
 
-  /** Drop every stale peer from the registry (session end / explicit
-   *  cleanup). Their blocks are the document's problem, not this
-   *  registry's — this only forgets the presence record. */
-  pruneStale(): string[] {
+  /** Drop peers silent past `afterMs` (default PEER_PRUNE_AFTER_MS,
+   *  5 minutes) from the registry. A peer stale for only ~30 s is
+   *  NOT dropped — it stays listed as "(away)" until it returns or
+   *  the prune window expires. Their blocks are the document's
+   *  problem, not this registry's — this only forgets the presence
+   *  record. */
+  pruneStale(afterMs: number = PEER_PRUNE_AFTER_MS): string[] {
+    const now = this.now();
     const dropped: string[] = [];
     for (const [login, peer] of this.peers) {
-      if (peer.stale) {
+      if (now - peer.lastHeartbeat > afterMs) {
         this.peers.delete(login);
         dropped.push(login);
       }

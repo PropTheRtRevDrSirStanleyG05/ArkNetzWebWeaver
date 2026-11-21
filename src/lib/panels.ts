@@ -275,7 +275,7 @@ export async function renderPanelHtml(
           `<ol>${steps.map((s) => `<li><strong>${esc(s.title)}</strong> — ${esc(s.description)}</li>`).join("")}</ol>
            <label>Domain <input id="an-domain-name" type="text" placeholder="computers.edu"></label>
            <button id="an-domain-check-btn" type="button">Check availability</button>
-           <label><input id="an-domain-terms" type="checkbox"> ${esc(CLAIM_COPY.termsLabel)}</label>
+           <label class="an-terms-label"><input id="an-domain-terms" type="checkbox"> ${esc(CLAIM_COPY.termsLabel)}</label>
            <button id="an-domain-claim-btn" type="button">${esc(CLAIM_COPY.submitLabel)}</button>
            <div id="an-domain-status" role="status">No claim in progress.</div>
            ${signedIn ? "" : `<p class="an-note" id="an-domain-signin-note">Sign in with GitHub first to claim a domain</p>`}
@@ -606,6 +606,10 @@ export function mountPanels(
     for (const btn of nav.querySelectorAll<HTMLButtonElement>("button[data-panel]")) {
       btn.setAttribute("aria-selected", String(btn.dataset.panel === panelId));
     }
+    // M3: switching to a panel scrolls the panel host into view — a
+    // panel clicked from the bottom of the page used to render above
+    // the fold, with the viewport still showing the reader/editor.
+    host.scrollIntoView({ block: "start" });
     void renderPanelHtml(app, panelId, state, opts).then((html) => {
       host.innerHTML = html;
       wirePanel(host, app, panelId, state, opts, () => showPanel(active));
@@ -622,8 +626,11 @@ export function mountPanels(
       btn.textContent = panel.title;
       btn.setAttribute("aria-selected", String(panel.id === active));
       btn.addEventListener("click", () => {
-        if (panel.id === "browse") opts.showReader();
+        // M5: only Builder keeps the editor open. Browse — and every
+        // other panel — shows the reader, so the editor never stacks
+        // below a panel with the reader hidden behind it.
         if (panel.id === "builder") opts.showEditor();
+        else opts.showReader();
         showPanel(panel.id);
       });
       nav.appendChild(btn);

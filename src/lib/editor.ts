@@ -31,7 +31,15 @@ import { colourForLogin } from "./collab/index.js";
 export interface CollabStartOptions {
   /** The acting user's OWN GitHub OAuth token. Null = refuse. */
   token: string | null;
+  /** Fallback repo owner (the signed-in user). Used only when no
+   *  site owner is known — see `siteOwner`. */
   owner: string;
+  /** GitHub login that OWNS the site repo (from the document's
+   *  registry entry, or the claim record that created it). The
+   *  relay addresses the owner's repo: a collaborator who is not
+   *  the owner joins the owner's repo, never their own. When
+   *  absent/blank, `owner` is used (own site / unknown owner). */
+  siteOwner?: string | null;
   /** Site repo name; defaults to siteRepoName(doc.domain). */
   repo?: string | null;
   /** GitHub login of the joining user. */
@@ -96,6 +104,11 @@ export class EditorState {
   collabConflicts: ConflictNote[] = [];
   /** Last presence list reported by the session (live + stale). */
   collabPeers: CollabPeer[] = [];
+  /** GitHub login that owns the site repo the active collab session
+   *  addresses (registry entry / claim record). "" when no session
+   *  is active. A collaborator who is not the owner still joins
+   *  this owner's repo — never their own. */
+  collabSiteOwner = "";
   /** True after a failed poll/write, until a poll succeeds again. */
   collabOffline = false;
   collabError: string | null = null;
@@ -131,9 +144,13 @@ export class EditorState {
   // --- Collaboration ---------------------------------------------------
 
   /** Join the collab session for this site (one session per site:
-   *  the relay branch derives from the domain). Throws when the
-   *  token is missing or the relay is unreachable — the caller must
-   *  surface that instead of showing a fake "collaborating" state. */
+   *  the relay branch derives from the domain). The relay addresses
+   *  the SITE OWNER's repo (`options.siteOwner`, falling back to
+   *  `options.owner` when the document has no owner): a
+   *  collaborator who does not own the site still joins the owner's
+   *  repo. Throws when the token is missing or the relay is
+   *  unreachable — the caller must surface that instead of showing
+   *  a fake "collaborating" state. */
   async startCollab(options: CollabStartOptions): Promise<void> {
     if (this.collabSession) throw new Error("collab session already started — stop it first");
     if (!options.token) {
@@ -142,6 +159,11 @@ export class EditorState {
       );
     }
     if (!options.login) throw new Error("collab session needs a GitHub login");
+    // The document's owner wins; the signed-in user is only the
+    // fallback for a document with no owner (e.g. the demo site).
+    // A blank siteOwner is the same as absent — never an empty owner.
+    const siteOwner = (options.siteOwner ?? "").trim() || options.owner;
+    this.collabSiteOwner = siteOwner;
     this.collabLogin = options.login;
     this.collabNow = options.now ?? (() => Date.now());
     this.collabVersions = new Map();
@@ -162,7 +184,7 @@ export class EditorState {
       this.collabLastBroadcast.set(id, { json: JSON.stringify(block), updatedAt: 0 });
     }
     const relay = new CollabRelay({
-      owner: options.owner,
+      owner: siteOwner,
       repo: options.repo ?? siteRepoName(this.doc.domain),
       domain: this.doc.domain,
       token: options.token,
@@ -210,6 +232,7 @@ export class EditorState {
     const session = this.collabSession;
     this.collabSession = null;
     this.collabPeers = [];
+    this.collabSiteOwner = "";
     if (!session) return { branchDeleted: false };
     return session.leave();
   }

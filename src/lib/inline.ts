@@ -36,8 +36,20 @@ const URL_HOSTS = new Set([
  *  data: form is strict — exactly `data:image/<type>;base64,<b64>`
  *  with no parameters, whitespace, or extra content — so a crafted
  *  URL cannot smuggle a different media type or a script past it. */
+/** Shared cap on data: URLs (512 KB of characters), enforced by
+ *  isSafeUrl itself: the HTML importer and the renderer apply the
+ *  same limit, so a >512 KB data: image cannot reach the renderer
+ *  through any path. A data: URL over the cap is unsafe, not merely
+ *  too long for one importer. */
+export const MAX_DATA_URL_CHARS = 512_000;
+
 export function isSafeUrl(url: string): boolean {
-  if (/^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(url)) return true;
+  if (url.startsWith("data:")) {
+    return (
+      url.length <= MAX_DATA_URL_CHARS &&
+      /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(url)
+    );
+  }
   try {
     const u = new URL(url);
     if (u.protocol === "arknetz:") return true;

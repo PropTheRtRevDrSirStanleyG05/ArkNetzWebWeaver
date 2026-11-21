@@ -11,6 +11,10 @@ body:focus{outline:none}
 .an-account{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;justify-content:flex-end;min-width:0;flex:1}
 #guest-badge{background:#374151;border-radius:999px;padding:.15rem .6rem;font-size:.85rem;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 #signin-btn{white-space:normal;text-align:left}
+/* L9: the account pill (Guest / signed-in name + Root Master badge)
+   wraps cleanly at 390px instead of truncating mid-name — the long
+   master username used to ellipsise to "Guest · Master: PropTheRtR…". */
+#account-pill{white-space:normal;text-align:left;overflow-wrap:break-word;min-width:0;max-width:100%}
 /* B8: sign-in status strip below the topbar — full message, wrapped,
    never inside the header. Hidden until there is a message. */
 .an-signin-status{padding:.5rem 1rem;background:#fef3c7;color:#92400e;font-size:.9rem;overflow-wrap:break-word}
@@ -33,8 +37,12 @@ button:disabled{opacity:.45;cursor:default}
 .an-sidebar li{margin:.25rem 0}
 .an-note{font-size:.85rem;color:#6b7280}
 .an-reader{min-width:0}
-/* B7: code blocks scroll internally, never widen the page. */
-.an-reader pre{max-width:100%;overflow-x:auto;box-sizing:border-box}
+/* B7: code blocks scroll internally, never widen the page.
+   L8: a subtle fade at the clipped edge signals that the block
+   scrolls sideways — long lines used to read cut off mid-word with
+   nothing saying so. */
+.an-reader pre{max-width:100%;overflow-x:auto;box-sizing:border-box;-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent 100%);mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent 100%)}
+pre.an-ed-text{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent 100%);mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent 100%)}
 .an-reader code{overflow-wrap:break-word}
 .an-reader img,.an-reader video,.an-reader iframe{max-width:100%}
 .an-footer{padding:.75rem 1rem;border-top:1px solid #e5e7eb;color:#6b7280;font-size:.85rem}
@@ -58,6 +66,13 @@ button:disabled{opacity:.45;cursor:default}
 .an-panel-host h3{font-size:14px;margin:12px 0 4px}
 .an-panel-host label{display:block;margin:6px 0;font-size:13px}
 .an-panel-host input,.an-panel-host select,.an-panel-host textarea{width:100%;box-sizing:border-box;margin-top:2px;padding:4px;max-width:100%}
+/* L6: a checkbox is never a full-width input — the Terms checkbox
+   used to fill the line, pushing its label onto a centred line of
+   its own. Checkboxes stay auto-width; the Terms label is a flex
+   row so box and text sit together. */
+.an-panel-host input[type="checkbox"]{width:auto}
+.an-panel-host label.an-terms-label{display:flex;gap:.4rem;align-items:flex-start}
+.an-panel-host label.an-terms-label input[type="checkbox"]{flex-shrink:0;margin-top:.15rem}
 .an-panel-host button{margin:4px 4px 4px 0;padding:4px 10px;cursor:pointer}
 
 /* --- IA settings form (B10): labels above inputs, full width, so a
@@ -74,7 +89,15 @@ button:disabled{opacity:.45;cursor:default}
 .an-editor{grid-column:2;grid-row:1;min-width:0;scroll-margin-top:.5rem}
 .an-editor-bar{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;padding:.5rem;border:1px solid #d1d5db;border-radius:8px;background:#f9fafb;margin-bottom:.75rem}
 .an-editor-bar select,.an-editor-bar input{padding:.35rem;border:1px solid #d1d5db;border-radius:6px}
-.an-editor-bar #editor-status{flex:1;min-width:200px;font-size:.85rem;color:#374151}
+/* L7: the status is a full-width row of its own at the foot of the
+   bar, never a ~250px column squeezed between the controls (which
+   wrapped it to 4 lines and stretched the toolbar to 4 rows). */
+.an-editor-bar #editor-status{flex:1 1 100%;order:99;min-width:0;font-size:.85rem;color:#374151}
+/* L10: the Import-URL label takes a wide flex share so its input is
+   a usable width (~320px at desktop, full bar width on mobile),
+   not the ~190px it used to be. */
+.an-editor-bar .an-url-label{flex:1 1 320px;min-width:200px}
+.an-editor-bar #html-import-url{width:100%;min-width:0}
 .an-file-label{font-size:.85rem}
 .an-editor-layout{display:grid;grid-template-columns:1fr 280px;gap:1rem}
 .an-editor-main{min-width:0}
@@ -87,8 +110,16 @@ button:disabled{opacity:.45;cursor:default}
 .an-ed-text:focus{background:#eff6ff}
 .an-ed-text:empty::before{content:"Empty — click to type";color:#9ca3af}
 .an-ed-field{width:100%;padding:.35rem;border:1px solid #d1d5db;border-radius:6px;margin:.2rem 0}
-.an-slash-row{display:flex;gap:.4rem;margin:.75rem 0}
-.an-slash-row input{flex:1;padding:.45rem .6rem;border:1px solid #d1d5db;border-radius:6px}
+/* H1: the block-inserter row wraps at 390px — it used to be
+   flex-wrap:nowrap with overflow visible, so the select sat
+   half-cut and the "+ Block" button entirely off-viewport
+   (scrollWidth 539 vs clientWidth 358). The input shrinks
+   (min-width:0) and the select/buttons wrap onto a second row,
+   all reachable. */
+.an-slash-row{display:flex;gap:.4rem;margin:.75rem 0;flex-wrap:wrap}
+.an-slash-row input{flex:1 1 160px;min-width:0;padding:.45rem .6rem;border:1px solid #d1d5db;border-radius:6px}
+.an-slash-row select{flex:0 1 auto;min-width:0;max-width:100%;padding:.45rem .6rem;border:1px solid #d1d5db;border-radius:6px}
+.an-slash-row button{flex-shrink:0}
 .an-preview{border:1px dashed #d1d5db;border-radius:8px;padding:.5rem}
 .an-editor-sidebar h3{font-size:.95rem;margin:.5rem 0}
 .an-editor-sidebar label{display:block;font-size:.85rem;margin:.4rem 0}

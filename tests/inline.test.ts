@@ -5,6 +5,7 @@ import {
   applyFormat,
   clearLink,
   isSafeUrl,
+  MAX_DATA_URL_CHARS,
   normalizeRuns,
   plainText,
   renderInlineRuns,
@@ -49,6 +50,23 @@ test("links are allow-listed: IA and arknetz: pass, javascript: and trackers are
   const bad = setLink(runsFromText("click here"), 0, 5, "javascript:alert(1)");
   assert.deepEqual(bad, runsFromText("click here"));
   assert.equal(renderInlineRuns(clearLink(linked, 0, 5)), "click here");
+});
+
+// D5 (fix pass 2): the 512 KB data: cap lives in isSafeUrl, not only
+// in the importer — a >512 KB data: image cannot reach the renderer
+// through any path, and the importer and renderer share one limit.
+test("D5: isSafeUrl caps data: URLs at MAX_DATA_URL_CHARS (512 KB), shared with the importer", async () => {
+  const { MAX_DATA_URL_CHARS: importerCap } = await import("../src/lib/html-import.js");
+  assert.equal(importerCap, MAX_DATA_URL_CHARS, "importer and renderer share one cap");
+  assert.equal(MAX_DATA_URL_CHARS, 512_000);
+  const prefix = "data:image/png;base64,";
+  const atCap = prefix + "A".repeat(MAX_DATA_URL_CHARS - prefix.length);
+  assert.equal(atCap.length, MAX_DATA_URL_CHARS);
+  assert.equal(isSafeUrl(atCap), true, "exactly at the cap is still safe");
+  const overCap = prefix + "A".repeat(MAX_DATA_URL_CHARS - prefix.length + 1);
+  assert.equal(isSafeUrl(overCap), false, "one char over the cap is unsafe");
+  assert.equal(isSafeUrl("data:image/png;base64,iVBORw0KGgo="), true, "a small data: image still passes");
+  assert.equal(isSafeUrl("data:image/svg+xml;base64,PHN2Zz4="), false, "SVG data: URLs stay refused");
 });
 
 test("renderInlineRuns escapes text and never emits raw HTML", () => {

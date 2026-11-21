@@ -101,6 +101,11 @@ test("panels: domains renders the claim form (terms + claim button) and the exac
   assert.match(guest, /an-domain-claim-btn/);
   assert.match(guest, /Claim this domain/);
   assert.match(guest, /Sign in with GitHub first to claim a domain/);
+  // L6 (fix pass 2): the Terms checkbox sits inline before its label
+  // text (flex row), not on a centred line of its own — the panel
+  // CSS used to give every input width:100%, which pushed the label
+  // text below the box.
+  assert.match(guest, /<label class="an-terms-label"><input id="an-domain-terms" type="checkbox">/);
   // Signed in: the refusal note is gone (the claim button stays —
   // the flow itself still refuses loudly without a token).
   const signedIn = await renderPanelHtml(app, "domains", state, {
@@ -207,6 +212,29 @@ test("panels: backends renders every backend unlinked with no accessors, linked 
   assert.match(linked, /Linked: alice@archive\.org/);
   // ipfs has no account provider and always shows "Not linked".
   assert.match(linked, /ipfs:/);
+});
+
+// M3 + M5 (fix pass 2): switching panels scrolls the panel host
+// into view and closes the editor unless the panel IS the builder.
+// mountPanels needs a real DOM (it calls the global document and
+// HTMLElement.scrollIntoView), so the node suite cannot mount it —
+// these assertions pin the wiring in the source, and the headless
+// run verifies the behaviour in a real browser.
+test("panels: showPanel scrolls the host into view; non-builder nav closes the editor", async () => {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../../src/lib/panels.ts", import.meta.url), "utf8");
+  assert.match(src, /host\.scrollIntoView\(\{ block: "start" \}\)/, "M3: showPanel scrolls the panel host into view");
+  const click = src.slice(src.indexOf('btn.addEventListener("click"'));
+  assert.match(click, /if \(panel\.id === "builder"\) opts\.showEditor\(\);\s*\n\s*else opts\.showReader\(\);/, "M5: only Builder keeps the editor open — every other panel shows the reader");
+});
+
+// L6 (fix pass 2): panel checkboxes never take the full-width input
+// rule, and the Terms label is a flex row.
+test("panels: panel CSS keeps checkboxes auto-width with the label beside the box", async () => {
+  const { readFileSync } = await import("node:fs");
+  const css = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+  assert.match(css, /\.an-panel-host input\[type="checkbox"\]\{width:auto\}/);
+  assert.match(css, /\.an-panel-host label\.an-terms-label\{display:flex;gap:\.4rem;align-items:flex-start\}/);
 });
 
 // Integration pass: the Wayback panel is wired through wireWaybackPanel

@@ -4,6 +4,7 @@
 // FakeGitHub — no test touches real GitHub.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { PEER_PRUNE_AFTER_MS } from "../src/lib/collab/types.js";
 import { EditorState } from "../src/lib/editor.js";
 import { FakeGitHub } from "./collab-fake-github.js";
 import { publishSite } from "../src/lib/publish.js";
@@ -193,4 +194,187 @@ test("REGRESSION: Publish still refuses on a SHA mismatch (HTTP 409)", async () 
   assert.ok(put);
   const body = JSON.parse(put.body ?? "{}") as Record<string, unknown>;
   assert.equal(body.sha, "sitesha1");
+});
+
+// ---------------------------------------------------------------------------
+// D2 (fix pass 1): the collab join addresses the SITE OWNER's repo.
+// ---------------------------------------------------------------------------
+
+/** Wrap a fake's fetch so the test can assert WHICH owner's repo the
+ *  relay addressed — the FakeGitHub itself ignores the owner segment,
+ *  which is exactly the hole D2 fell through. */
+function ownerRecordingFetch(fake: FakeGitHub): {
+  fetchFn: GithubFetchFn;
+  ownersSeen: string[];
+} {
+  const ownersSeen: string[] = [];
+  const fetchFn: GithubFetchFn = async (url, init) => {
+    const m = /^https:\/\/api\.github\.com\/repos\/([^/]+)\//.exec(url);
+    if (m) ownersSeen.push(m[1] as string);
+    return fake.fetchFn(url, init);
+  };
+  return { fetchFn, ownersSeen };
+}
+
+async function joinWithFetch(
+  fetchFn: GithubFetchFn,
+  login: string,
+  opts?: {
+    owner?: string;
+    siteOwner?: string | null;
+    domain?: string;
+    now?: () => number;
+  },
+): Promise<EditorState> {
+  const domain = opts?.domain ?? "computers.edu";
+  const ed = new EditorState({
+    domain,
+    title: domain,
+    blocks: [
+      { type: "h1", text: "Hello", id: "b1" },
+      { type: "p", text: "Body", id: "b2" },
+    ],
+  });
+  await ed.startCollab({
+    token: `tok-${login}`,
+    owner: opts?.owner ?? OWNER,
+    siteOwner: opts?.siteOwner,
+    login,
+    fetchFn,
+    now: opts?.now,
+    autoPoll: false,
+  });
+  return ed;
+}
+
+test("D2: a collaborator who does not own the site joins the OWNER's repo, not their own", async () => {
+  const fake = new FakeGitHub();
+  const { fetchFn, ownersSeen } = ownerRecordingFetch(fake);
+  // Bob joins alice's site: the joiner is bob, the site owner is alice.
+  const bob = await joinWithFetch(fetchFn, "bob", { owner: "bob", siteOwner: "alice" });
+  try {
+    assert.ok(bob.collabSession?.joined, "bob joined");
+    assert.equal(bob.collabSiteOwner, "alice");
+    assert.ok(ownersSeen.length > 0, "the relay made GitHub calls");
+    assert.ok(
+      ownersSeen.every((o) => o === "alice"),
+      `every relay call must address alice's repo, saw owners: ${[...new Set(ownersSeen)].join(", ")}`,
+    );
+  } finally {
+    await bob.stopCollab();
+  }
+});
+
+test("D2: an owner-less document falls back to the signed-in user", async () => {
+  const fake = new FakeGitHub();
+  const { fetchFn, ownersSeen } = ownerRecordingFetch(fake);
+  const bob = await joinWithFetch(fetchFn, "bob", { owner: "bob" });
+  try {
+    assert.ok(bob.collabSession?.joined);
+    assert.equal(bob.collabSiteOwner, "bob");
+    assert.ok(ownersSeen.every((o) => o === "bob"));
+  } finally {
+    await bob.stopCollab();
+  }
+  // A blank siteOwner is the same as absent.
+  const { fetchFn: fetchFn2, ownersSeen: ownersSeen2 } = ownerRecordingFetch(new FakeGitHub());
+  const bob2 = await joinWithFetch(fetchFn2, "bob", { owner: "bob", siteOwner: "   " });
+  try {
+    assert.equal(bob2.collabSiteOwner, "bob");
+    assert.ok(ownersSeen2.every((o) => o === "bob"));
+  } finally {
+    await bob2.stopCollab();
+  }
+});
+
+test("D2: joining a repo that genuinely does not exist names the owner/repo it tried", async () => {
+  const fake = new FakeGitHub();
+  const { fetchFn, ownersSeen } = ownerRecordingFetch(fake);
+  const ed = new EditorState({
+    domain: "other.edu",
+    title: "Other",
+    blocks: [{ type: "h1", text: "Hello", id: "b1" }],
+  });
+  await assert.rejects(
+    () =>
+      ed.startCollab({
+        token: "tok-bob",
+        owner: "bob",
+        siteOwner: "alice",
+        login: "bob",
+        fetchFn,
+        autoPoll: false,
+      }),
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      assert.match(message, /alice\/arknetz-site-other-edu/, "names the owner/repo it tried");
+      assert.match(message, /may not exist yet; Publish it once first/);
+      return true;
+    },
+  );
+  assert.equal(ed.collabSession, null, "no fake session after a refused join");
+  assert.ok(ownersSeen.includes("alice"));
+});
+
+// ---------------------------------------------------------------------------
+// D1 (fix pass 1): a gracefully-left peer leaves other peers' lists.
+// ---------------------------------------------------------------------------
+
+test("D1: B leaves (file deleted) + A polls → bob gone from A.collabPeers, not merely stale", async () => {
+  const fake = new FakeGitHub();
+  const alice = await joinEditor(fake, "alice", "tok-alice", () => 1000);
+  const bob = await joinEditor(fake, "bob", "tok-bob", () => 1000);
+  try {
+    await alice.collabSession?.pollOnce();
+    assert.ok(
+      alice.collabPeers.some((p) => p.login === "bob"),
+      "bob is present before leaving",
+    );
+    await bob.stopCollab();
+    await alice.collabSession?.pollOnce();
+    assert.ok(
+      !alice.collabPeers.some((p) => p.login === "bob"),
+      "bob is gone from A.collabPeers after leaving",
+    );
+    assert.ok(alice.collabPeers.some((p) => p.login === "alice"), "alice still lists herself");
+  } finally {
+    if (alice.collabSession) await alice.stopCollab();
+    if (bob.collabSession) await bob.stopCollab();
+  }
+});
+
+test("D1 (corrected, fix pass 2): a peer silent 31 s stays in collabPeers as stale (away), and is pruned only after 5 minutes of silence", async () => {
+  const fake = new FakeGitHub();
+  let now = 10_000;
+  const clock = () => now;
+  const alice = await joinEditor(fake, "alice", "tok-alice", clock);
+  const bob = await joinEditor(fake, "bob", "tok-bob", clock);
+  try {
+    await alice.collabSession?.pollOnce();
+    assert.ok(alice.collabPeers.some((p) => p.login === "bob"));
+    // Bob's tab crashes: no leave, no heartbeat — 31 s of silence.
+    now += 31_000;
+    await alice.collabSession?.pollOnce();
+    const bobPeer = alice.collabPeers.find((p) => p.login === "bob");
+    assert.ok(bobPeer, "a peer silent 31 s stays listed, marked stale (away)");
+    assert.equal(bobPeer?.stale, true);
+    assert.equal(alice.collabPeers.length, 2, "alice + stale bob remain");
+    // 5 more minutes of silence: now the prune fires.
+    now += PEER_PRUNE_AFTER_MS;
+    await alice.collabSession?.pollOnce();
+    assert.ok(
+      !alice.collabPeers.some((p) => p.login === "bob"),
+      "silent peer is pruned after 5 minutes of silence",
+    );
+    assert.equal(alice.collabPeers.length, 1, "only alice remains");
+    // Bob returns: a fresh heartbeat revives him on the next poll.
+    await bob.collabSession?.pollOnce();
+    await alice.collabSession?.pollOnce();
+    const back = alice.collabPeers.find((p) => p.login === "bob");
+    assert.ok(back, "a returning peer re-syncs and reappears");
+    assert.equal(back?.stale, false);
+  } finally {
+    if (alice.collabSession) await alice.stopCollab();
+    if (bob.collabSession) await bob.stopCollab();
+  }
 });

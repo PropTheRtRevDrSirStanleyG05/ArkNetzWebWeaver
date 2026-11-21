@@ -17,6 +17,8 @@ import {
   defaultBlock,
   formatListItem,
   formatTableCell,
+  getListItem,
+  getTableCell,
   indentListItem,
   insertListItem,
   makeTableRows,
@@ -56,8 +58,8 @@ import { describePeerCursors } from "./collab/cursors.js";
 import { describeConflict } from "./collab/types.js";
 import { buildSiteOpenedViewModel } from "./domains-ui.js";
 import type { OpenedSite } from "./domains.js";
-import { syncRunsFromText } from "./inline.js";
-import type { FormatPatch } from "./inline.js";
+import { plainText, renderInlineRuns, runsFromText, syncRunsFromText } from "./inline.js";
+import type { FormatPatch, InlineRun } from "./inline.js";
 import { blockRuns } from "./editor.js";
 
 export interface EditorUiOptions {
@@ -68,6 +70,12 @@ export interface EditorUiOptions {
   getGithubToken: () => string | null;
   /** The signed-in GitHub login (repo owner for Publish). */
   getGithubLogin: () => string | null;
+  /** GitHub login that owns the site repo for this domain (the
+   *  document's registry entry, or the claim record that created
+   *  it). Null/undefined = unknown — the join falls back to the
+   *  signed-in user. A collaborator who does not own the site
+   *  still joins the owner's repo, never their own. */
+  getSiteOwner?: (domain: string) => string | null;
   /** The per-domain site repo, when it exists. Null = not created yet. */
   getSiteRepo: (domain: string) => string | null;
   githubFetch: GithubFetchFn;
@@ -82,7 +90,25 @@ export interface EditorUiOptions {
   iaFetch: IaFetchFn;
 }
 
+/** Which repo owner a collab join addresses: the document's owner
+ *  (registry entry / claim record) when known, otherwise the
+ *  signed-in user. A blank owner is the same as unknown. Exported
+ *  for tests — the join button drives it through handleCollabJoin. */
+export function resolveCollabSiteOwner(
+  siteOwner: string | null | undefined,
+  login: string | null,
+): string {
+  const owner = (siteOwner ?? "").trim();
+  if (owner) return owner;
+  return (login ?? "").trim();
+}
+
 const TEXT_BLOCKS = new Set(["h1", "h2", "h3", "p", "quote", "code"]);
+
+/** The collab strip's idle label. The space is a non-breaking space
+ *  (L11): at 390px the strip is narrow and "Not" / "collaborating."
+ *  wrapped onto two lines. */
+const NOT_COLLABORATING = "Not\u00a0collaborating.";
 
 /** A role may edit the document when it can draft or publish pages.
  *  Viewer has neither flag, so it is read-only; writer can draft. */
@@ -183,6 +209,13 @@ export class EditorUI {
    *  polls arrive without a local edit, so the peer list / cursor
    *  marks / conflict notes refresh on a tick, not on keystrokes). */
   private collabTimer: ReturnType<typeof setInterval> | null = null;
+  /** Until this timestamp, a successful autosave does not write the
+   *  status line (M4): a failed HTML import sets it, so a pending
+   *  autosave from an earlier edit cannot overwrite the failure
+   *  with "Autosaved locally…" 800 ms later. The draft still saves
+   *  — only the success message is held. Any later setStatus call
+   *  (a user action) replaces the message as normal. */
+  private statusHoldUntil = 0;
 
   constructor(
     private readonly root: HTMLElement,
@@ -328,7 +361,7 @@ export class EditorUI {
     const status = document.createElement("span");
     status.id = "collab-status";
     status.className = "an-note";
-    status.textContent = "Not collaborating.";
+    status.textContent = NOT_COLLABORATING;
     const peers = document.createElement("div");
     peers.id = "collab-peers";
     peers.className = "an-collab-peers";
@@ -675,6 +708,20 @@ export class EditorUI {
         if (this.editor) this.editor.dirty = true;
       },
       () => {
+        // M2: the canvas shows the new formatting in place — the
+        // shared bar deliberately does NOT rebuild the canvas (that
+        // would destroy the focused editable and its selection), so
+        // the targeted editable is re-rendered from its runs here.
+        const t = target();
+        if (t) {
+          if (t.kind === "item") {
+            const item = getListItem(block, t.path);
+            if (item) this.setEditableContent(t.editable, item.runs && item.runs.length > 0 ? item.runs : runsFromText(item.text ?? ""));
+          } else {
+            const cell = getTableCell(block, t.row, t.col);
+            if (cell) this.setEditableContent(t.editable, cell.runs && cell.runs.length > 0 ? cell.runs : runsFromText(cell.text ?? ""));
+          }
+        }
         this.refreshPreview();
         this.scheduleAutosave();
       },
@@ -724,10 +771,16 @@ export class EditorUI {
 
   /** Fetch for the HTML importer's URL import: the injected
    *  htmlFetch when the shell provided one, else an adapter over the
-   *  GitHub fetch (same shape — status + text — no auth attached). */
+   *  GitHub fetch (same shape — ok + status + text — no auth
+   *  attached). The `ok` flag is derived from the status: without
+   *  it a 404 body would be parsed as a page instead of reported
+   *  as the HTTP failure it is (M4). */
   private htmlFetch(): HtmlFetchFn {
     if (this.opts.htmlFetch) return this.opts.htmlFetch;
-    return (url: string) => this.opts.githubFetch(url, { method: "GET", headers: {} });
+    return async (url: string) => {
+      const res = await this.opts.githubFetch(url, { method: "GET", headers: {} });
+      return { ok: res.status >= 200 && res.status < 300, status: res.status, text: () => res.text() };
+    };
   }
 
   /** Import an .html file into the current document. The importer
@@ -773,9 +826,29 @@ export class EditorUI {
    *  session broadcasts them to peers like any other local edit. An
    *  empty document also adopts the imported title and nav; a
    *  document with content keeps its own. Counts are shown plainly,
-   *  with the importer's notes when it dropped anything. */
+   *  with the importer's notes when it dropped anything.
+   *
+   *  M4: a FETCH failure (importHtmlFromUrl could not fetch the page
+   *  at all — 404, network down, no fetch function) imports nothing
+   *  and says so in the status line, including the HTTP status when
+   *  known — and it returns BEFORE afterChange(), so the autosave
+   *  that afterChange schedules cannot overwrite the failure with
+   *  "Autosaved locally…" 800 ms later (that overwrite is why a 404
+   *  used to fail silently). The empty fallback document is never
+   *  adopted: a failed fetch must not rename the document. */
   private applyHtmlImport(result: HtmlImportResult): void {
     if (!this.editor) return;
+    const fetchFailure = result.notes.find(
+      (n) => (n.startsWith("Fetching ") && n.includes("failed")) || n.startsWith("No fetch function was provided"),
+    );
+    if (result.imported === 0 && fetchFailure) {
+      // Hold the status line: a pending autosave from an earlier
+      // edit must not overwrite this failure with "Autosaved
+      // locally…" when its timer fires.
+      this.statusHoldUntil = Date.now() + 10_000;
+      this.setStatus(`HTML import failed — ${fetchFailure}`);
+      return;
+    }
     if (this.editor.blocks.length === 0) {
       if (result.doc.title) this.editor.doc.title = result.doc.title;
       if ((this.editor.doc.nav ?? []).length === 0 && (result.doc.nav ?? []).length > 0) {
@@ -795,26 +868,37 @@ export class EditorUI {
   /** Join the collab session for this site. The engine refuses
    *  loudly without a token (or when the relay is unreachable) —
    *  that message is surfaced in the status line, never swallowed
-   *  and never replaced with a fake "collaborating" state. */
+   *  and never replaced with a fake "collaborating" state. The
+   *  relay addresses the DOCUMENT's owner (registry entry / claim
+   *  record), falling back to the signed-in user only when the
+   *  document has no owner — a collaborator who does not own the
+   *  site still joins the owner's repo. */
   private async handleCollabJoin(): Promise<void> {
     if (!this.editor) return;
     const token = this.opts.getGithubToken();
     const login = this.opts.getGithubLogin();
+    const siteOwner = resolveCollabSiteOwner(
+      this.opts.getSiteOwner?.(this.editor.doc.domain),
+      login,
+    );
     try {
       await this.editor.startCollab({
         token,
         owner: login ?? "",
+        siteOwner,
         login: login ?? "",
         fetchFn: this.opts.githubFetch,
         autoPoll: true,
       });
     } catch (err) {
       // The engine refuses loudly without a token (or when the relay
-      // is unreachable) — surface that message in BOTH status lines,
-      // never swallow it and never show a fake "collaborating" state.
+      // is unreachable) — surface that message in the editor status
+      // line, never swallow it and never show a fake "collaborating"
+      // state. L7: the message lives ONLY here — the collab strip
+      // stays "Not collaborating." instead of repeating it, so a
+      // refused join no longer shows the same error twice.
       const message = err instanceof Error ? err.message : String(err);
       this.setStatus(message);
-      this.setCollabStatus(message);
       return;
     }
     this.startCollabTimer();
@@ -844,13 +928,6 @@ export class EditorUI {
     }
   }
 
-  /** Write the collab strip's own status line (next to Join/Leave),
-   *  when the strip exists. */
-  private setCollabStatus(text: string): void {
-    const status = this.root.ownerDocument.getElementById("collab-status");
-    if (status) status.textContent = text;
-  }
-
   private startCollabTimer(): void {
     this.stopCollabTimer();
     const w = window as unknown as {
@@ -873,6 +950,13 @@ export class EditorUI {
    *  the app uses the timer + afterChange). */
   refreshCollab(): void {
     this.renderCollab();
+  }
+
+  /** Set the editor status line from outside the editor (the claim
+   *  watcher reports the REGISTER issue closing here — the screen
+   *  the user is looking at after a claim). */
+  setStatusLine(text: string): void {
+    this.setStatus(text);
   }
 
   /** The canvas block wrap for a block id, or null (nested column
@@ -930,15 +1014,14 @@ export class EditorUI {
       for (const el of stale) (el as HTMLElement).remove();
     }
     if (!state) {
-      if (status) status.textContent = "Not collaborating.";
+      if (status) status.textContent = NOT_COLLABORATING;
       return;
     }
     if (!joined) {
-      if (status) {
-        status.textContent = state.collabError
-          ? `Collaboration error: ${state.collabError}`
-          : "Not collaborating.";
-      }
+      // L7: a collab error is surfaced once, in the editor status
+      // line (handleCollabJoin's catch) — the strip stays idle here
+      // instead of repeating "Collaboration error: …" beside it.
+      if (status) status.textContent = NOT_COLLABORATING;
       return;
     }
     const peers = state.collabPeers;
@@ -1067,6 +1150,10 @@ export class EditorUI {
     if (!this.editor) return;
     const result = await autosaveDraft(this.store, `draft:${this.editor.doc.domain}`, this.editor.doc, attempt);
     if (result.ok) {
+      // M4: a held status line (e.g. a failed HTML import) is never
+      // overwritten by the routine autosave message — the draft
+      // still saved, the failure stays readable.
+      if (Date.now() < this.statusHoldUntil) return;
       this.setStatus(`Autosaved locally at ${new Date(result.savedAt).toLocaleTimeString()} — drafts stay on this device until Publish.`);
     } else {
       this.setStatus(`${result.error} Retrying in ${Math.round(result.retryInMs / 1000)}s — your edits are still in the canvas, nothing was lost.`);
@@ -1196,6 +1283,22 @@ export class EditorUI {
     return wrap;
   }
 
+  /** Render typed inline runs into a contenteditable (M2, fix pass
+   *  2): the canvas shows bold/italic/underline/strikethrough/code/
+   *  links while editing, exactly as the preview and reader render
+   *  them — the canvas used to set plain textContent, so formatting
+   *  was invisible until the preview below. Unformatted text takes
+   *  the plain-text path, so typing and selection offsets (which read
+   *  textContent) are unchanged. Safe by construction: the runs are
+   *  typed, never raw HTML, and renderInlineRuns escapes the text. */
+  private setEditableContent(el: HTMLElement, runs: InlineRun[]): void {
+    if (runs.some((r) => r.format !== undefined)) {
+      el.innerHTML = renderInlineRuns(runs);
+    } else {
+      el.textContent = plainText(runs);
+    }
+  }
+
   /** The editable body of one block. Text blocks are contenteditable;
    *  media blocks show the shared renderer's output plus controls;
    *  container blocks render their children editable too. */
@@ -1207,7 +1310,9 @@ export class EditorUI {
       el.className = "an-ed-text";
       // Viewers read: contenteditable is off for roles that cannot edit (B4).
       el.contentEditable = this.canEdit() ? "true" : "false";
-      el.textContent = block.text ?? "";
+      // M2: render the block's runs, not plain text, so inline
+      // formatting is visible in the canvas while editing.
+      this.setEditableContent(el, blockRuns(block));
       el.addEventListener("focus", () => this.shareCursor(block, el));
       el.addEventListener("input", () => {
         this.updateBlockText(block, el.textContent ?? "");
@@ -1474,7 +1579,8 @@ export class EditorUI {
     const editable = document.createElement("div");
     editable.className = "an-ed-text";
     editable.contentEditable = this.canEdit() ? "true" : "false";
-    editable.textContent = item.text ?? "";
+    // M2: a formatted list item renders its runs in the canvas too.
+    this.setEditableContent(editable, item.runs && item.runs.length > 0 ? item.runs : runsFromText(item.text ?? ""));
     editable.addEventListener("focus", () => {
       this.listTableTarget = { block, kind: "item", path: [...path], editable };
       this.shareCursor(block, editable);
@@ -1522,7 +1628,8 @@ export class EditorUI {
     const editable = document.createElement("div");
     editable.className = "an-ed-text";
     editable.contentEditable = this.canEdit() ? "true" : "false";
-    editable.textContent = cell.text ?? "";
+    // M2: a formatted table cell renders its runs in the canvas too.
+    this.setEditableContent(editable, cell.runs && cell.runs.length > 0 ? cell.runs : runsFromText(cell.text ?? ""));
     editable.addEventListener("focus", () => {
       this.listTableTarget = { block, kind: "cell", row, col, editable };
       this.shareCursor(block, editable);

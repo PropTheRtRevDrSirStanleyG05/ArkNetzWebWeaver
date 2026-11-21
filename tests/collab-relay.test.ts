@@ -8,7 +8,7 @@ import { FakeGitHub } from "./collab-fake-github.js";
 import { CollabRelay, collabBranchName, collabPeerPath } from "../src/lib/collab/relay.js";
 import { CollabSyncEngine } from "../src/lib/collab/sync.js";
 import type { LocalSnapshot } from "../src/lib/collab/sync.js";
-import { COLLAB_STATE_VERSION, PEER_EXPIRY_MS } from "../src/lib/collab/types.js";
+import { COLLAB_STATE_VERSION, PEER_EXPIRY_MS, PEER_PRUNE_AFTER_MS } from "../src/lib/collab/types.js";
 import type { BlockNode } from "../src/lib/types.js";
 
 const OWNER = "alice";
@@ -261,11 +261,10 @@ test("engine: failed poll marks offline and keeps state; next good poll recovers
   assert.equal(engine.lastError, null);
 });
 
-test("engine: a peer gone >30 s is stale (blocks stay), and returns re-sync", async () => {
+test("engine: a peer silent >30 s is stale (blocks stay, marked stale), pruned only after 5 min of silence, and returns re-sync", async () => {
   const fake = new FakeGitHub();
   let now = 10_000;
   const clock = () => now;
-  const bobSeen: string[] = [];
   const engine = new CollabSyncEngine(
     new CollabRelay({ owner: OWNER, repo: REPO, domain: DOMAIN, token: "tok-alice", fetchFn: fake.fetchFn }),
     "alice",
@@ -282,25 +281,82 @@ test("engine: a peer gone >30 s is stale (blocks stay), and returns re-sync", as
   const first = await engine.pollOnce();
   assert.deepEqual(first.peers, ["bob"]);
   assert.equal(engine.presence.get("bob")?.stale, false);
-  // Bob goes quiet; 31 s later Alice polls again.
+  // Bob goes quiet; 31 s later Alice polls again. D1 (restored
+  // contract, fix pass 2): silence past the 30 s expiry MARKS him
+  // stale — he stays listed as "(away)" with his blocks marked,
+  // and is NOT pruned. His file is still on the relay (a crash, not
+  // a leave), so only the 5-minute prune can remove him.
   now += PEER_EXPIRY_MS + 1000;
   const second = await engine.pollOnce();
   assert.deepEqual(second.expired, ["bob"]);
-  assert.equal(engine.presence.get("bob")?.stale, true);
+  assert.deepEqual(second.pruned, [], "a peer silent 31 s is stale, not pruned");
+  assert.equal(engine.presence.get("bob")?.stale, true, "silent peer stays listed, marked stale");
   // Bob's blocks are still the document's business, not presence's:
-  // the engine reports them stale, never deletes them.
+  // the engine never deletes blocks — the snapshot is untouched —
+  // and while Bob is stale his blocks ARE flagged stale.
   const snap: LocalSnapshot = {
     blocks: [{ type: "p", text: "Bob block", id: "bb" }],
     versions: new Map([["bb", { updatedAt: 10_000, author: "bob" }]]),
     placement: new Map(),
     deleted: new Map(),
   };
-  assert.deepEqual([...engine.staleBlockIds(snap)], ["bb"]);
-  void bobSeen;
+  assert.deepEqual(snap.blocks.map((b) => b.id), ["bb"], "staleness never deletes blocks");
+  assert.deepEqual([...engine.staleBlockIds(snap)], ["bb"], "a stale peer's blocks are flagged stale");
+  // 5 more minutes of silence: now the prune fires.
+  now += PEER_PRUNE_AFTER_MS;
+  const pruned = await engine.pollOnce();
+  assert.deepEqual(pruned.pruned, ["bob"]);
+  assert.equal(engine.presence.get("bob"), undefined, "silent peer is pruned after 5 minutes");
+  assert.deepEqual([...engine.staleBlockIds(snap)], [], "a pruned peer's blocks are no longer flagged stale");
   // Bob returns: fresh heartbeat, next poll revives him.
   await bobRelay.writeOwn(stateFile("bob", [{ type: "p", text: "Bob block", id: "bb" }], now));
   const third = await engine.pollOnce();
   assert.equal(third.ok, true);
   assert.equal(engine.presence.get("bob")?.stale, false);
-  assert.deepEqual([...engine.staleBlockIds(snap)], [], "a returned peer's blocks are live again");
+  assert.deepEqual(third.pruned, []);
+});
+
+test("engine: a peer whose state file is gone (graceful leave) is removed on the next poll, not merely marked stale", async () => {
+  const fake = new FakeGitHub();
+  let now = 10_000;
+  const clock = () => now;
+  let lastPresence: string[] = [];
+  const engine = new CollabSyncEngine(
+    new CollabRelay({ owner: OWNER, repo: REPO, domain: DOMAIN, token: "tok-alice", fetchFn: fake.fetchFn }),
+    "alice",
+    {
+      getLocalSnapshot: (): LocalSnapshot => ({ blocks: [], versions: new Map(), placement: new Map(), deleted: new Map() }),
+      onRemoteStates: () => undefined,
+      onPresence: (peers) => {
+        lastPresence = peers.map((p) => p.login);
+      },
+    },
+    clock,
+  );
+  await engine.relay.ensureBranch();
+  const bobRelay = new CollabRelay({ owner: OWNER, repo: REPO, domain: DOMAIN, token: "tok-bob", fetchFn: fake.fetchFn });
+  await bobRelay.writeOwn(stateFile("bob", [{ type: "p", text: "Bob block", id: "bb" }], now));
+  const first = await engine.pollOnce();
+  assert.deepEqual(first.peers, ["bob"]);
+  assert.ok(lastPresence.includes("bob"));
+  // Bob leaves gracefully: his state file is deleted at once.
+  assert.equal(await bobRelay.deleteOwn("bob"), true);
+  // Alice polls 5 s later — long before the 30 s expiry. Bob must
+  // be GONE from presence, not merely stale.
+  now += 5_000;
+  const second = await engine.pollOnce();
+  assert.deepEqual(second.left, ["bob"]);
+  assert.deepEqual(second.pruned, [], "a graceful leave is a removal, not an expiry prune");
+  assert.equal(engine.presence.get("bob"), undefined);
+  assert.ok(!lastPresence.includes("bob"), "onPresence reports bob gone");
+  // A failed poll in between must NOT remove anyone: presence is
+  // only ever removed on a successful read.
+  await bobRelay.writeOwn(stateFile("bob", [{ type: "p", text: "Bob block", id: "bb" }], now));
+  await engine.pollOnce();
+  assert.ok(engine.presence.get("bob"), "bob is back after re-joining");
+  fake.failAll = true;
+  const failed = await engine.pollOnce();
+  assert.equal(failed.ok, false);
+  assert.equal(engine.presence.get("bob")?.login, "bob", "failed poll keeps the last known presence");
+  fake.failAll = false;
 });

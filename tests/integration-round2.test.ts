@@ -388,6 +388,10 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 25));
 function setup(opts?: {
   token?: string | null;
   login?: string | null;
+  /** GitHub login that owns the site repo for this document
+   *  (registry entry / claim record). Null = unknown. */
+  siteOwner?: string | null;
+  githubFetch?: GithubFetchFn;
   htmlFetch?: HtmlFetchFn;
   fake?: FakeGitHub;
 }): {
@@ -414,8 +418,9 @@ function setup(opts?: {
     }) as unknown as IaFetchFn,
     getGithubToken: () => token,
     getGithubLogin: () => login,
+    getSiteOwner: () => opts?.siteOwner ?? null,
     getSiteRepo: (domain: string) => `arknetz-site-${domain.replace(/[^a-z0-9]/gi, "-")}`,
-    githubFetch: fake.fetchFn,
+    githubFetch: opts?.githubFetch ?? fake.fetchFn,
     htmlFetch: opts?.htmlFetch,
   };
   const ui = new EditorUI(root as unknown as HTMLElement, uiOpts);
@@ -539,6 +544,48 @@ test("HTML import (URL): an empty URL field refuses plainly instead of fetching"
   assert.match(statusOf(fakeDoc), /Type a page URL first/);
 });
 
+// M4 (fix pass 2): a 404 fetch fails LOUDLY in the status line —
+// with the HTTP status — imports nothing, and never adopts the
+// empty fallback document's title. The failure must survive the
+// autosave that follows a successful import (the old code ran
+// afterChange() first, so the autosave overwrote the failure with
+// "Autosaved locally…" 800 ms later and the 404 failed silently).
+test("HTML import (URL): a 404 shows the HTTP status, imports nothing, and does not rename the document", async () => {
+  const { ui, fakeDoc } = setup({
+    htmlFetch: (async () => ({ ok: false, status: 404, text: async () => "Not Found" })) as unknown as HtmlFetchFn,
+  });
+  const doc = freshDoc();
+  doc.blocks = [];
+  doc.title = "My Empty Site";
+  ui.open(doc);
+  const urlInput = elById(fakeDoc, "html-import-url");
+  urlInput.value = "https://example.com/gone.html";
+  elById(fakeDoc, "html-import-url-btn").fire("click");
+  await flush();
+  assert.match(statusOf(fakeDoc), /HTML import failed/);
+  assert.match(statusOf(fakeDoc), /Fetching https:\/\/example\.com\/gone\.html failed \(HTTP 404\)/);
+  assert.equal((ui.doc as SiteDocument).blocks.length, 0, "a failed fetch imports nothing");
+  assert.equal((ui.doc as SiteDocument).title, "My Empty Site", "the empty fallback document is never adopted");
+});
+
+// M4 (fix pass 2): the default fetch adapter (no injected htmlFetch)
+// derives `ok` from the status, so a 404 through the GitHub-fetch
+// adapter is still reported as the HTTP failure it is, not parsed
+// as a page.
+test("HTML import (URL): the default adapter reports a 404 from a fetch without an ok flag", async () => {
+  const { ui, fakeDoc } = setup({
+    githubFetch: (async () => ({ status: 404, text: async () => "Not Found" })) as unknown as GithubFetchFn,
+  });
+  ui.open(freshDoc());
+  const urlInput = elById(fakeDoc, "html-import-url");
+  urlInput.value = "https://example.com/gone.html";
+  elById(fakeDoc, "html-import-url-btn").fire("click");
+  await flush();
+  assert.match(statusOf(fakeDoc), /HTML import failed/);
+  assert.match(statusOf(fakeDoc), /HTTP 404/);
+  assert.equal((ui.doc as SiteDocument).blocks.length, 2, "a failed fetch imports nothing");
+});
+
 // ---------------------------------------------------------------------------
 // Collaboration UI surface
 // ---------------------------------------------------------------------------
@@ -568,13 +615,71 @@ async function joinBob(fake: FakeGitHub): Promise<EditorState> {
   return bob;
 }
 
+test("collab Join as a non-owner joins the site OWNER's repo (D2), and falls back to the joiner when the owner is unknown", async () => {
+  const fake = new FakeGitHub();
+  // Record the owner segment of every relay call: the FakeGitHub
+  // itself ignores it, which is the hole D2 fell through.
+  const ownersSeen: string[] = [];
+  const recordingFetch: GithubFetchFn = async (url, init) => {
+    const m = /^https:\/\/api\.github\.com\/repos\/([^/]+)\//.exec(url);
+    if (m) ownersSeen.push(m[1] as string);
+    return fake.fetchFn(url, init);
+  };
+  // Bob joins alice's site: the document's owner is alice.
+  const { ui, fakeDoc } = setup({ token: "tok-bob", login: "bob", siteOwner: "alice", fake, githubFetch: recordingFetch });
+  ui.open(collabDoc());
+  const ed = ui.editorState as EditorState;
+  try {
+    elById(fakeDoc, "collab-join-btn").fire("click");
+    await flush();
+    assert.ok(ed.collabSession?.joined, "bob joined");
+    assert.equal(ed.collabSiteOwner, "alice");
+    assert.ok(ownersSeen.length > 0, "the relay made GitHub calls");
+    assert.ok(
+      ownersSeen.every((o) => o === "alice"),
+      `every relay call must address alice's repo, saw: ${[...new Set(ownersSeen)].join(", ")}`,
+    );
+    assert.match(collabStatusOf(fakeDoc), /Collaborating as bob on computers\.edu/);
+    elById(fakeDoc, "collab-leave-btn").fire("click");
+    await flush();
+    assert.equal(ed.collabSession, null);
+  } finally {
+    if (ed.collabSession) await ed.stopCollab();
+  }
+
+  // Owner unknown: the join falls back to the signed-in user.
+  const fake2 = new FakeGitHub();
+  const ownersSeen2: string[] = [];
+  const recordingFetch2: GithubFetchFn = async (url, init) => {
+    const m = /^https:\/\/api\.github\.com\/repos\/([^/]+)\//.exec(url);
+    if (m) ownersSeen2.push(m[1] as string);
+    return fake2.fetchFn(url, init);
+  };
+  const second = setup({ token: "tok-bob", login: "bob", siteOwner: null, fake: fake2, githubFetch: recordingFetch2 });
+  second.ui.open(collabDoc());
+  const ed2 = second.ui.editorState as EditorState;
+  try {
+    elById(second.fakeDoc, "collab-join-btn").fire("click");
+    await flush();
+    assert.ok(ed2.collabSession?.joined);
+    assert.equal(ed2.collabSiteOwner, "bob");
+    assert.ok(ownersSeen2.every((o) => o === "bob"));
+  } finally {
+    if (ed2.collabSession) await ed2.stopCollab();
+  }
+});
+
 test("collab Join without a token refuses loudly and makes no network calls", async () => {
   const { ui, fakeDoc, fake } = setup({ token: null, login: null });
   ui.open(collabDoc());
   elById(fakeDoc, "collab-join-btn").fire("click");
   await flush();
   assert.match(statusOf(fakeDoc), /own GitHub token/);
-  assert.match(collabStatusOf(fakeDoc), /own GitHub token/);
+  // L7 (fix pass 2): the refusal is surfaced ONCE, in the editor
+  // status line — the collab strip stays idle instead of repeating
+  // the same message beside it.
+  assert.doesNotMatch(collabStatusOf(fakeDoc), /own GitHub token/);
+  assert.equal(collabStatusOf(fakeDoc), "Not collaborating.");
   assert.equal(fake.calls.length, 0, "no GitHub call without a token");
   assert.equal(ui.editorState?.collabSession, null);
   assert.equal(

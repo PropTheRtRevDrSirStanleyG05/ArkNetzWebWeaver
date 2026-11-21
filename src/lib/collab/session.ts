@@ -138,6 +138,9 @@ export class CollabSession {
     if (!this.joined) return { branchDeleted: false };
     this.joined = false;
     await this.relay.deleteOwn(this.login);
+    // My presence record goes at once — peers learn I left from the
+    // missing file on their next poll, and I stop listing myself.
+    this.engine.leave();
     let branchDeleted = false;
     try {
       const remaining = await this.relay.listPeers();

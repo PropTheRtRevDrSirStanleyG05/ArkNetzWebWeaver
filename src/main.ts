@@ -18,7 +18,7 @@ import {
   installAppBridgeListener,
 } from "./lib/viewer/app-bridge.js";
 import type { AppBridgeReplyTarget, AppSaveStore } from "./lib/viewer/app-bridge.js";
-import { buildAuthorizeUrl, completeOAuthCallback, isMasterUser, randomState, savePendingOAuthState, takePendingOAuthState } from "./lib/auth.js";
+import { buildAuthorizeUrl, completeOAuthCallback, randomState, savePendingOAuthState, takePendingOAuthState } from "./lib/auth.js";
 import { addGithubAccount } from "./lib/network/accounts.js";
 import { attachMedia, IaUploadQueue } from "./lib/ia-media.js";
 import type { IaKeys } from "./lib/ia-media.js";
@@ -37,6 +37,7 @@ import { siteRepoName } from "./lib/publish.js";
 import type { GithubFetchFn } from "./lib/publish.js";
 import { claimDomainAndOpenSite } from "./lib/domains.js";
 import type { OpenedSite } from "./lib/domains.js";
+import { ClaimWatcher } from "./lib/claim-watcher.js";
 import { buildSiteOpenedViewModel } from "./lib/domains-ui.js";
 import {
   BookmarkManager,
@@ -44,13 +45,15 @@ import {
   createMemoryShellStore,
 } from "./lib/shell.js";
 import { DEMO_SITE } from "./lib/sample.js";
-import { MASTER_GITHUB_USER } from "./lib/config.js";
 import { EditorUI } from "./lib/editor-ui.js";
 import type { SiteDocument } from "./lib/types.js";
 import { createArkNetzApp } from "./lib/app.js";
 import type { ArkNetzApp } from "./lib/app.js";
 import { installDeepLinkListener, isOAuthCallbackUrl } from "./lib/deep-link.js";
 import { mountPanels } from "./lib/panels.js";
+import { AccountPill } from "./lib/network/account-pill.js";
+import type { PillElement } from "./lib/network/account-pill.js";
+import type { AccountProfile, AccountProvider } from "./lib/network/accounts.js";
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
 
@@ -88,6 +91,9 @@ let githubLogin: string | null = null;
 /** The app object, once init() has built it — the sign-in completion
  *  (which can arrive via a deep link at any moment) needs the keyring. */
 let app: ArkNetzApp | null = null;
+/** The top-bar Account Switcher Pill (D6): created once the app
+ *  object exists, re-rendered on every GitHub status refresh. */
+let accountPill: AccountPill | null = null;
 /** Rebuild the panel nav after sign-in/out (Moderation appears only
  *  for the Root Master). Set by mountPanels in init(). */
 let panelsRefreshNav: (() => void) | null = null;
@@ -95,6 +101,15 @@ let panelsRefreshNav: (() => void) | null = null;
 // of this, and the reader re-renders from the edited copy on close, so
 // View and Edit always show the same renderer output.
 let currentDoc: SiteDocument = JSON.parse(JSON.stringify(DEMO_SITE)) as SiteDocument;
+/** GitHub login that owns the site repo for currentDoc (registry
+ *  entry / claim record). Null = unknown (demo site, external link,
+ *  or a load whose entry could not be read) — collab join then
+ *  falls back to the signed-in user. */
+let currentSiteOwner: string | null = null;
+/** Watches the pending REGISTER issue of the last filed claim (D3):
+ *  one watcher at a time, stopped when the claim resolves, fails, or
+ *  the editor closes. */
+let claimWatcher: ClaimWatcher | null = null;
 let editorUi: EditorUI | null = null;
 
 /** Build the EditorUI once (the edit toggle and the claim hook share
@@ -111,6 +126,7 @@ function ensureEditorUi(): EditorUI {
       },
       getGithubToken: () => githubToken,
       getGithubLogin: () => githubLogin,
+      getSiteOwner: () => currentSiteOwner,
       getSiteRepo: (domain: string) => siteRepoName(domain),
       githubFetch,
       htmlFetch,
@@ -207,10 +223,12 @@ async function renderCurrent(): Promise<void> {
   const parsed = parseAddress(tab.address);
   if (parsed.kind === "demo") {
     currentDoc = cloneDoc(DEMO_SITE);
+    currentSiteOwner = null;
     reader.innerHTML = `<p class="an-note">Demo site bundled with the shell — the registry does not exist yet, so this is not a live network site.</p>` + renderSiteWithSaveBridge(DEMO_SITE);
     return;
   }
   if (parsed.kind === "https") {
+    currentSiteOwner = null;
     reader.innerHTML = `<p>External link — opened in the system browser in the Tauri app. <a href="${parsed.value}">${parsed.value}</a></p>`;
     return;
   }
@@ -218,8 +236,19 @@ async function renderCurrent(): Promise<void> {
   try {
     const site = await resolver.loadSite(parsed.value);
     currentDoc = cloneDoc(site);
+    // The registry entry knows the site repo's owner — collab join
+    // addresses the owner's repo, so a non-owner collaborator joins
+    // the right repo. Best-effort: the shard fetch is cached, and a
+    // failure here only loses the owner (join falls back to the
+    // signed-in user) — never the site itself.
+    try {
+      currentSiteOwner = (await resolver.resolve(parsed.value)).owner;
+    } catch {
+      currentSiteOwner = null;
+    }
     reader.innerHTML = renderSiteWithSaveBridge(site);
   } catch (err) {
+    currentSiteOwner = null;
     reader.innerHTML = `<h1>Could not load ${parsed.value}</h1><p>${err instanceof Error ? err.message : String(err)}</p><p class="an-note">The central registry repos do not exist yet (licence decision pending). Until they do, only the demo site resolves.</p>`;
   }
 }
@@ -295,17 +324,75 @@ async function go(address: string): Promise<void> {
 }
 
 /** Settings sidebar + top bar, from the one source of truth
- *  (githubToken/githubLogin). The guest badge shows the signed-in
- *  login — with the Root Master marker only when the login is the
- *  master user; enforcement stays GitHub's 403, never the UI. */
+ *  (githubToken/githubLogin). The Account Switcher Pill shows the
+ *  active account (or Guest); the Accounts panel copy points at it.
+ *  Enforcement stays GitHub's 403, never the UI. */
 function refreshGithubStatus(): void {
   const ghStatus = $("gh-status");
   ghStatus.textContent = githubToken
     ? `GitHub: signed in as ${githubLogin ?? "unknown"} — Publish can run.`
     : "GitHub: not signed in. Publish needs sign-in (and a GitHub OAuth App must exist first).";
-  ($("guest-badge") as HTMLElement).textContent = githubLogin
-    ? `Signed in as ${githubLogin}${isMasterUser(githubLogin) ? " · Root Master" : ""}`
-    : `Guest · Master: ${MASTER_GITHUB_USER}`;
+  renderAccountPill();
+}
+
+/** Build the Account Switcher Pill once, re-render it on every
+ *  status refresh. The pill reads the keyring (snapshot + master
+ *  check); switching goes through switchAccount below, which owns
+ *  the token + session update. No app object yet (before init) →
+ *  the pill keeps its static "Guest" label from index.html. */
+function renderAccountPill(): void {
+  if (!app) return;
+  if (!accountPill) {
+    accountPill = new AccountPill(
+      $("account-pill") as unknown as PillElement,
+      $("account-menu") as unknown as PillElement,
+      {
+        keyring: app.keyring,
+        switchAccount: (provider, id) => switchAccount(provider, id),
+        onAddAccount: () => startGitHubSignIn(),
+        onSwitched: () => {
+          refreshGithubStatus();
+          panelsRefreshNav?.();
+        },
+        reportStatus: (message) => {
+          const status = $("signin-status");
+          status.textContent = message;
+          status.hidden = false;
+        },
+        createElement: (tag) => document.createElement(tag) as unknown as PillElement,
+      },
+    );
+  }
+  accountPill.render();
+}
+
+/** Switch the active account from the Account Switcher Pill (D6).
+ *  The token is revealed FIRST: when the keyring is locked the
+ *  secret cannot be read, so the switch is refused before anything
+ *  changes — the pill, the session, and the active account all stay
+ *  as they were. On success the keyring switch persists (switchAll),
+ *  the session token/login move to the new GitHub account, and the
+ *  pill + panels re-render. Non-GitHub providers switch the keyring
+ *  active account only (no session token). Throws on failure; the
+ *  pill reports it. */
+async function switchAccount(
+  provider: AccountProvider,
+  id: string,
+): Promise<{ profile: AccountProfile; token: string | null }> {
+  if (!app) throw new Error("the app is not ready yet — try switching again in a moment");
+  let token: string | null = null;
+  if (provider === "github") {
+    // Throws when locked (or the account is gone): no switch happens.
+    token = await app.keyring.revealSecret("github", id);
+  }
+  const selected = await app.keyring.switchAll({ [provider]: id });
+  const profile = selected[provider];
+  if (!profile) throw new Error(`could not switch to the ${provider} account "${id}"`);
+  if (provider === "github") {
+    githubToken = token;
+    githubLogin = profile.username ?? profile.label;
+  }
+  return { profile, token };
 }
 
 /** Start the GitHub OAuth sign-in: build the authorize URL (client id
@@ -465,10 +552,51 @@ function wireSettings(): void {
  *  shows the new site instead of the old one. */
 function handleSiteOpened(opened: OpenedSite): void {
   currentDoc = cloneDoc(opened.doc);
+  // The claim record knows the site repo's owner (the claimer) —
+  // collab join addresses that repo.
+  currentSiteOwner = opened.registryEntry.owner;
   const ui = ensureEditorUi();
   ($("reader") as HTMLElement).hidden = true;
   ui.showSiteOpened(opened);
+  startClaimWatcher(opened);
   ($("editor") as HTMLElement).scrollIntoView({ block: "start" });
+}
+
+/** Watch the filed claim's REGISTER issue until it closes (D3): the
+ *  pending-claim screen said it updates when the issue closes, and
+ *  this is what does it. One watcher at a time — a new claim stops
+ *  the old one. Resolves into the editor status line; a terminal
+ *  failure (issue gone, token dead) says so plainly and stops
+ *  instead of spinning. Stopped when the editor closes. */
+function startClaimWatcher(opened: OpenedSite): void {
+  claimWatcher?.stop();
+  claimWatcher = null;
+  const ui = editorUi;
+  if (!ui) return;
+  const watcher = new ClaimWatcher(
+    { fetchFn: githubFetch, getToken: () => githubToken },
+    {
+      onResolved: (claim) => {
+        claimWatcher = null;
+        ui.setStatusLine(
+          `"${claim.domain}" is now registered — the register bot closed the claim issue (${claim.issueUrl ?? "no issue URL"}).`,
+        );
+      },
+      onFailed: (claim, reason) => {
+        claimWatcher = null;
+        ui.setStatusLine(
+          `Could not confirm the claim for "${claim.domain}": ${reason}. The claim may still be pending — check ${claim.issueUrl ?? "the registry repo"} directly.`,
+        );
+      },
+      onError: (claim, reason) => {
+        ui.setStatusLine(
+          `Still waiting on the claim for "${claim.domain}" — the last check failed: ${reason}`,
+        );
+      },
+    },
+  );
+  claimWatcher = watcher;
+  watcher.start(opened.claim);
 }
 
 async function init(): Promise<void> {
@@ -628,6 +756,10 @@ async function init(): Promise<void> {
     ($("editor") as HTMLElement).scrollIntoView({ block: "start" });
   };
   document.addEventListener("arknetz:editor-closed", () => {
+    // Closing the editor ends the pending-claim watch too: nothing
+    // polls for a claim nobody is looking at.
+    claimWatcher?.stop();
+    claimWatcher = null;
     if (editorUi?.doc) currentDoc = cloneDoc(editorUi.doc);
     ($("reader") as HTMLElement).hidden = false;
     ($("reader") as HTMLElement).innerHTML = renderSiteWithSaveBridge(currentDoc);

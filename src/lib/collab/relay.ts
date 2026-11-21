@@ -167,7 +167,7 @@ export class CollabRelay {
       const text = await main.text().catch(() => "");
       throw new Error(
         `collab relay: cannot branch from main — HTTP ${main.status}: ${text.slice(0, 200)}. ` +
-          `The site repo ${this.repo} may not exist yet; Publish it once first.`,
+          `The site repo ${this.owner}/${this.repo} may not exist yet; Publish it once first.`,
       );
     }
     const mainJson = (await main.json()) as { object?: { sha?: unknown } };

@@ -10,9 +10,19 @@
 
 import type { BlockNode } from "../types.js";
 
-/** A peer is gone from presence when no heartbeat has been seen for
- *  longer than this. 30 s, per the task spec. */
+/** A peer is stale ("(away)") when no heartbeat has been seen for
+ *  longer than this. 30 s, per the task spec. Stale is a MARK, not a
+ *  removal: a stale peer stays listed (and its blocks stay marked)
+ *  until it returns or the much longer prune window below expires. */
 export const PEER_EXPIRY_MS = 30_000;
+/** A peer whose relay state file still exists but whose heartbeat
+ *  has been silent for longer than this is pruned from presence.
+ *  5 minutes: long enough that a crashed tab, a flaky connection,
+ *  or a laptop lid stays "(away)" instead of vanishing, short
+ *  enough that a peer who never comes back does not linger
+ *  forever. A peer whose state file is GONE (graceful leave) is
+ *  removed at once, without waiting for either window. */
+export const PEER_PRUNE_AFTER_MS = 300_000;
 /** How often a joined peer re-writes its heartbeat (well inside the
  *  30 s expiry, so one failed write does not drop the peer). */
 export const HEARTBEAT_MS = 10_000;
@@ -72,8 +82,9 @@ export interface CollabPeer {
   /** Where their caret is now, if they have shared one. */
   cursor: CursorPosition | null;
   /** True when the peer has not heartbeated inside PEER_EXPIRY_MS.
-   *  Stale peers stay listed (marked stale) until they return or the
-   *  session ends — their blocks are never removed. */
+   *  Stale peers stay listed (marked stale) until they return or
+   *  the PEER_PRUNE_AFTER_MS window expires — their blocks are
+   *  never removed. */
   stale: boolean;
 }
 

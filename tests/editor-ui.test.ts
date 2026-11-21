@@ -8,7 +8,7 @@
 // querySelectorAll for the editor's real code paths to run end to end.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { EditorUI, SavedSelection, roleCanEdit, roleCanPublish, selectionOffsetsIn } from "../src/lib/editor-ui.js";
+import { EditorUI, SavedSelection, resolveCollabSiteOwner, roleCanEdit, roleCanPublish, selectionOffsetsIn } from "../src/lib/editor-ui.js";
 import type { EditorUiOptions } from "../src/lib/editor-ui.js";
 import { parseSlashCommand, slashSuggestions } from "../src/lib/blocks.js";
 import { appThemeCss } from "../src/lib/themes.js";
@@ -521,6 +521,76 @@ test("B3: SavedSelection falls back to the captured range, is single-use, and ig
 });
 
 // ---------------------------------------------------------------------------
+// M2 (fix pass 2) — the canvas renders inline formatting, not plain text
+// ---------------------------------------------------------------------------
+
+test("M2: Bold shows <strong> in the canvas itself, not only in the preview", () => {
+  const { ui, fakeDoc } = setup();
+  ui.open(freshDoc());
+  const canvas = fakeDoc.getElementById("editor-canvas") as FakeElement;
+  const editable = findEditable(canvas);
+  assert.equal(editable.textContent, "Hello world");
+  assert.equal(editable.innerHTML, "", "unformatted text takes the plain-text path");
+  setSelection(editable, "Hello world", 6, 11); // "world"
+  const boldBtn = findButton(canvas, "B");
+  boldBtn.fire("mousedown");
+  boldBtn.fire("click");
+  // The format action rebuilds the canvas (afterChange) — the NEW
+  // editable must carry the formatting as markup, or the user cannot
+  // see their bold while editing.
+  const after = findEditable(fakeDoc.getElementById("editor-canvas") as FakeElement);
+  assert.match(after.innerHTML, /<strong>world<\/strong>/, "canvas renders the bold run");
+  assert.match(after.innerHTML, /Hello /);
+});
+
+test("M2: imported HTML with <strong> renders bold in the canvas on open", () => {
+  const { ui, fakeDoc } = setup();
+  const doc = freshDoc();
+  doc.blocks = [
+    {
+      type: "p",
+      text: "Hello bold world",
+      id: "b1",
+      runs: [{ text: "Hello " }, { text: "bold", format: { bold: true } }, { text: " world" }],
+    },
+    {
+      type: "p",
+      text: "plain and italic",
+      id: "b2",
+      runs: [{ text: "plain and " }, { text: "italic", format: { italic: true } }],
+    },
+  ];
+  ui.open(doc);
+  const canvas = fakeDoc.getElementById("editor-canvas") as FakeElement;
+  const editables = findAll(canvas, (el) => el.className.split(" ").includes("an-ed-text"));
+  assert.equal(editables.length, 2);
+  assert.match(editables[0]?.innerHTML ?? "", /<strong>bold<\/strong>/);
+  assert.match(editables[1]?.innerHTML ?? "", /<em>italic<\/em>/);
+});
+
+test("M2: a formatted list item renders its runs in the canvas", () => {
+  const { ui, fakeDoc } = setup();
+  const doc = freshDoc();
+  doc.blocks = [
+    {
+      type: "list",
+      id: "b1",
+      listStyle: "ul",
+      listItems: [
+        { text: "plain item" },
+        { text: "bold item", runs: [{ text: "bold", format: { bold: true } }, { text: " item" }] },
+      ],
+    },
+  ];
+  ui.open(doc);
+  const canvas = fakeDoc.getElementById("editor-canvas") as FakeElement;
+  const editables = findAll(canvas, (el) => el.className.split(" ").includes("an-ed-text"));
+  assert.equal(editables.length, 2);
+  assert.equal(editables[0]?.textContent, "plain item");
+  assert.match(editables[1]?.innerHTML ?? "", /<strong>bold<\/strong>/);
+});
+
+// ---------------------------------------------------------------------------
 // R1 — clicking into a contenteditable must not rebuild the canvas
 // ---------------------------------------------------------------------------
 
@@ -710,4 +780,13 @@ test("B9: sidebar nav rows carry the full URL as their title tooltip at render t
   assert.equal(findAll(aboutRow, (el) => el.tagName === "wbr").length, 1);
   const homeRow = rows.find((r) => r.textContent.includes("Home")) as FakeElement;
   assert.equal(findAll(homeRow, (el) => el.tagName === "wbr").length, 0);
+});
+
+test("D2: resolveCollabSiteOwner prefers the document owner, falls back to the signed-in user", () => {
+  assert.equal(resolveCollabSiteOwner("alice", "bob"), "alice");
+  assert.equal(resolveCollabSiteOwner(null, "bob"), "bob");
+  assert.equal(resolveCollabSiteOwner(undefined, "bob"), "bob");
+  assert.equal(resolveCollabSiteOwner("   ", "bob"), "bob", "a blank owner is unknown");
+  assert.equal(resolveCollabSiteOwner("alice", null), "alice");
+  assert.equal(resolveCollabSiteOwner(null, null), "");
 });

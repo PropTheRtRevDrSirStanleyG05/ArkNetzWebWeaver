@@ -30,19 +30,20 @@
 // but renders bulleted.
 
 import { MAX_LIST_DEPTH, MAX_LIST_ITEMS, MAX_TABLE_COLS, MAX_TABLE_ROWS, newBlockId } from "./blocks.js";
-import { isSafeUrl, normalizeRuns, plainText } from "./inline.js";
+import { isSafeUrl, MAX_DATA_URL_CHARS, normalizeRuns, plainText } from "./inline.js";
 import type { InlineFormat, InlineRun } from "./inline.js";
 import type { BlockNode, ListItem, SiteDocument, TableCell } from "./types.js";
+
+/** Re-exported so existing importers of the cap keep working — the
+ *  limit itself lives in inline.ts, next to isSafeUrl, which
+ *  enforces it for every path into the renderer. */
+export { MAX_DATA_URL_CHARS };
 
 /** Default cap on blocks per import. Large pages stop here; the cap
  *  and the number of blocks left out are reported in plain language
  *  in the result notes, and the left-out blocks are counted as
  *  skipped. Override with opts.maxBlocks. */
 export const DEFAULT_MAX_BLOCKS = 500;
-
-/** Data: image URLs longer than this are treated as unsafe (a page
- *  should not smuggle megabytes of base64 into one block). */
-export const MAX_DATA_URL_CHARS = 512_000;
 
 export interface HtmlImportOptions {
   /** Domain for the new document. Default "imported.arknetz". */
@@ -445,12 +446,10 @@ function safeHref(raw: string | undefined, ctx: ImportCtx): string | null {
 
 /** An image src is safe when the renderer would render it, plus
  *  data:image/* (png/jpeg/gif/webp, base64) — the import allow-list
- *  in the brief. NOTE: the renderer itself (isSafeUrl) does not
- *  accept data: URLs yet, so a data: image block renders as
- *  "[image blocked: unsafe source]" until the renderer allows it;
- *  the block is still emitted, with its real bytes, rather than
- *  dropping the image. SVG data: URLs are never allowed (they can
- *  carry scripts). */
+ *  in the brief. isSafeUrl accepts the same strict data: form and
+ *  enforces the shared MAX_DATA_URL_CHARS cap, so the importer and
+ *  the renderer agree on every image src. SVG data: URLs are never
+ *  allowed (they can carry scripts). */
 function safeImageSrc(raw: string | undefined, ctx: ImportCtx): string | null {
   if (raw === undefined) return null;
   const src = raw.trim();

@@ -54,8 +54,16 @@ for delivery; collab deliberately does not follow it.)
 ## What syncs, and how
 
 - **Presence**: who is in this site now (GitHub login + deterministic
-  display colour from `colourForLogin`). Heartbeat every 10 s; a peer
-  gone >30 s drops from the live list (stale, not deleted).
+  display colour from `colourForLogin`). Heartbeat every 10 s. A peer
+  whose state file is gone from the relay left gracefully and is
+  removed from presence on the next poll; a peer silent >30 s is
+  marked stale and stays listed as "(away)" with its blocks marked
+  stale; only after 5 minutes of silence (`PEER_PRUNE_AFTER_MS`)
+  with the file still present is it pruned from presence. Either
+  way their blocks stay in the document, and a returning peer
+  re-syncs in one poll. (D1 correction, fix pass 2, 2026-11-21: fix
+  pass 1 pruned at 30 s, deleting the intentional "(away)" phase —
+  the original contract is stale-at-30 s, prune-at-5-minutes.)
 - **Live cursors/selections**: block id + text offsets, with names and
   colours (`describePeerCursors`). They ride in the same state file
   as blocks, so they propagate on the same poll.
@@ -74,14 +82,16 @@ for delivery; collab deliberately does not follow it.)
 - **Session lifecycle**: `join()` creates the branch from `main` when
   needed, writes the first state file, starts poll (5 s) + heartbeat
   (10 s) timers. `leave()` stops the timers, deletes my state file,
-  and deletes the branch when I was the last peer. A crash or a
-  closed tab is the same as going offline: my file stays until my
-  heartbeat ages past 30 s, then I drop from presence; my blocks
-  stay in the document either way.
-- **Offline peers**: their blocks stay, marked stale (the editor
-  exposes `staleBlockIds()`). When they return they re-sync in one
-  poll. A failed poll sets `collabOffline`, keeps the last known
-  presence and document untouched, and retries on the next poll.
+  drops my presence record, and deletes the branch when I was the
+  last peer. A crash or a closed tab is the same as going offline:
+  my file stays until my heartbeat ages past 30 s (I show as
+  "(away)" with my blocks marked stale), then I am pruned from
+  presence after 5 minutes of silence; my blocks stay in the
+  document either way.
+- **Offline peers**: their blocks stay in the document. When they
+  return they re-sync in one poll. A failed poll sets
+  `collabOffline`, keeps the last known presence and document
+  untouched, and retries on the next poll.
 
 ## What syncs — scope
 
@@ -117,7 +127,7 @@ itself is the editor UI's job, not this module's.
 - `types.ts` — state-file shape + validation, colours, conflict notes.
 - `merge.ts` — per-block LWW merge, deterministic insert ordering,
   tombstones, `diffBlocks`.
-- `presence.ts` — join/heartbeat/leave/30 s expiry registry.
+- `presence.ts` — join/heartbeat/leave/30 s stale marking + 5-minute prune registry.
 - `cursors.ts` — cursor marks for the UI (`describePeerCursors`).
 - `relay.ts` — Contents-API relay (branch + per-peer files).
 - `sync.ts` — poll/merge/heartbeat engine + offline handling.
