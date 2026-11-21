@@ -2581,8 +2581,19 @@ tree). No release created; keystore untouched; dictionary untouched.
   17-minute battery run was CPU-starved by a concurrent battery +
   screenshot harness and was killed before it finished; this 770/770
   is the clean re-run after the fixes.
-- **Push:** TODO-PUSH (client repo only; no release; no keystore;
-  no dictionary touch).
+- **Push:** DONE 2026-11-21 ~23:55 UTC — client repo only, head
+  `339024a19c2568f95c932458061379dfe984faef` (29 files, 724,739 bytes;
+  verified by read-back: `src/lib/p2p/host.ts`, `types.ts`,
+  INTEGRATION.md). This push also carries the phase-1 P2P core for
+  the first time — it was never pushed before, and the remote tree
+  cannot compile without it. NOT in this push: the media agent's
+  files (`src/lib/p2p/call-session.ts`, `media-*.ts`, `mixer.ts`,
+  `screen-share.ts`, `tests/p2p-call-session.test.ts`,
+  `tests/p2p-media*.test.ts`, `tests/p2p-mixer.test.ts`,
+  `tests/p2p-screen-share.test.ts`) — still local-only, theirs to
+  push; no pushed file imports them. No release; no keystore; no
+  dictionary touch. This INTEGRATION.md line itself landed in a
+  follow-up record commit (see below).
 - **Still needs real-device verification (not claimable from this
   VM):** two real devices, one behind symmetric NAT, with and
   without TURN — real WebRTC peer connections (no WebRTC in Node),
