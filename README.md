@@ -2,7 +2,7 @@
 
 Zero-server, $0/month decentralized web by STANBEYOND. **Licence: MIT**
 (decided by Stanley 2026-11-20; see `LICENSE`, Copyright (c) 2026
-PropTheRtRevDrSirStanleyG05 / STANBEYOND).
+Stanley Garland).
 
 This is the **core shell + visual builder + all four pre-GitHub phases**
 (mail, ArkDrive, viewer/network features, domains/moderation/backends/
@@ -299,7 +299,7 @@ separately; this build does not attempt apt changes.
 
 ```
 ArkNetzWebWeaver/
-├── LICENSE                      MIT, Copyright (c) 2026 PropTheRtRevDrSirStanleyG05 / STANBEYOND
+├── LICENSE                      MIT, Copyright (c) 2026 Stanley Garland
 ├── README.md
 ├── package.json                 MIT, @tauri-apps/api + cli, typescript, @types/node
 ├── tsconfig.json

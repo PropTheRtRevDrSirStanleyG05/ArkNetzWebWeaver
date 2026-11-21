@@ -2,7 +2,7 @@
 name = "arknetzwebweaver"
 version = "0.1.0"
 description = "ArkNetzWebWeaver by STANBEYOND — zero-server, $0/month decentralized web (core shell)"
-authors = ["STANBEYOND"]
+authors = ["Stanley Garland"]
 edition = "2021"
 
 [lib]

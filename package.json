@@ -11,6 +11,7 @@
     "typescript": "^5.9.0"
   },
   "license": "MIT",
+  "author": "Stanley Garland",
   "name": "arknetzwebweaver",
   "private": true,
   "scripts": {
