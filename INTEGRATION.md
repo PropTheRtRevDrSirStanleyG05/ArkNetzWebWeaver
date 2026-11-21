@@ -2346,8 +2346,11 @@ Audit: `hunt4/mobile/MOBILE-AUDIT.md` (360/390/412 × 844, DSF 2, touch).
   with `tsc` errors in peer-manager/signaling/transport — a STALE dist
   built while the sibling P2P agent was mid-write (its files finished
   changing 22:35 UTC); the source tree was never red after that. This
-  hunt touched NO p2p file. Re-push: unblocked (see below). No release
-  created; keystore untouched.
+  hunt touched NO p2p file. **Re-push DONE 2026-11-21 ~22:58 UTC: live
+  head `d07418664f9f4142ab9020fa1af8ec1928882e45`** (28 files, all
+  byte-verified live). No release created; keystore untouched. The P2P
+  phase-1 files are green in the scaffold but unpushed (separate
+  program's step).
 - Version bumped to **0.4.1** (patch) — package.json, tauri.conf.json,
   Cargo.toml, footer, hunt-3 version test. PROTOCOL_VERSION 0.1.0 left.
 
@@ -2356,5 +2359,6 @@ Audit: `hunt4/mobile/MOBILE-AUDIT.md` (360/390/412 × 844, DSF 2, touch).
 OAuth on a real phone (enable Device Flow first — see above); APK
 install on a real device (0.4.1 never built as a release — no `tauri
 build` was run per the benchmark constraint); `cargo check` for the
-opener plugin after the system-deps reinstall; live REGISTER round-trip
+opener plugin — PASSED (exit 0, 2m 09s, after the system-deps reinstall);
+live REGISTER round-trip
 (no GitHub Action has run anywhere yet); live mail/IA/collab round-trips.
