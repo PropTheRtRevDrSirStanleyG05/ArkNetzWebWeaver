@@ -1621,3 +1621,226 @@ not a side piece.
   to the keyring lasts the session only — same pre-existing limit as
   every other account (see "Still open" above). Flipping
   `useIndexedDB: true` is a wider change needing a deliberate call.
+
+---
+
+# Real-time multi-user collaboration — 2026-11-21 (Stanley 03:59)
+
+**This overrides the earlier v1.0 note that live-cursor collaboration
+was out of scope.** Built in `src/lib/collab/` + collab-session wiring
+in `src/lib/editor.ts` only. No other owned files were touched
+(`blocks.ts`, `renderer.ts`, `editor-ui.ts`, `types.ts`, `domains.ts`,
+`domains-ui.ts`, `wxr.ts` untouched). No AI builder / MCP / x402, no
+Fediverse, no RSS, no Gmail/SMTP bridge, no new dependencies, no
+shared/master keys.
+
+## What was built
+
+- `src/lib/collab/types.ts` — state-file shape + validation, deterministic
+  peer colours, `ConflictNote` + `describeConflict`.
+- `src/lib/collab/merge.ts` — per-block last-write-wins on
+  `(updatedAt, author)`; deterministic ordering of concurrent inserts
+  at the same index (placement keys); delete tombstones (absence from
+  a peer's list is never a delete); `diffBlocks` (local broadcast ops).
+- `src/lib/collab/presence.ts` — join/heartbeat/leave, 30 s expiry
+  (stale peers stay listed, marked stale; their blocks stay).
+- `src/lib/collab/cursors.ts` — live cursor/selection marks for the
+  editor UI (`describePeerCursors`, self excluded, stale flagged).
+- `src/lib/collab/relay.ts` — GitHub Contents-API relay (see below).
+- `src/lib/collab/sync.ts` — poll/merge/heartbeat engine, offline
+  flag + retry, stale-block reporting.
+- `src/lib/collab/session.ts` — join/leave lifecycle + timers; branch
+  deleted when the last peer leaves.
+- `src/lib/collab/index.ts`, `src/lib/collab/README.md` (full rationale).
+- `src/lib/editor.ts` (collab wiring only) — `startCollab` /
+  `stopCollab`, `applyRemoteBlockOps`, `applyRemoteStates`,
+  `setLocalCursor`, `staleBlockIds`, `collabConflicts`,
+  `collabPeers`, `collabOffline`; local block mutations diff + broadcast.
+  Collab covers blocks only — header/footer/nav/pages are not synced.
+- Tests: `tests/collab.test.ts` (13), `tests/collab-relay.test.ts` (8),
+  `tests/collab-editor.test.ts` (7) — **28 tests, 28 pass**, all against
+  an in-memory fake GitHub (`tests/collab-fake-github.ts`); no test
+  hits real GitHub. Includes the two-peer convergence proof (A adds X,
+  B adds Y, both end with X+Y in the same order), same-block conflict
+  (newer wins, loser recorded with its text), presence join/leave/30 s
+  expiry, cursor propagation, relay round-trip, offline → recovery,
+  and a regression test that Publish still refuses on a SHA mismatch
+  (HTTP 409, with the attempted SHA in the PUT body).
+
+## Relay choice + rationale
+
+**Chosen: a `collab/<domain-slug>` branch in the per-domain site repo,
+one state file per peer (`peers/<login>.json`), via the GitHub Contents
+API with the user's OWN OAuth token (`public_repo` scope).**
+- `public_repo` grants exactly what this needs on public repos
+  (Contents API, git-refs branch create/delete, per-file SHA guard);
+  site repos are public by design, so no wider scope is required.
+- Each peer writes only its own file, so peers never contend for the
+  same SHA — no write-write conflict is possible at the relay layer.
+- It reuses the exact API pattern `publish.ts` already proves
+  (GET-for-SHA then PUT-with-SHA), and it is invisible to readers:
+  `main` and `site.json.zst` are untouched until someone Publishes.
+- Reads use `api.github.com`, never `raw.githubusercontent.com` — the
+  raw CDN caches branch content, so polls could see minutes-old state.
+**Rejected: GitHub Issues as the relay.** Every op would be a public
+Issue/comment in the site repo (visible noise), with no per-peer file
+separation and no SHA guard. Full rationale in `src/lib/collab/README.md`.
+
+## Honest limits — what the sync can and cannot do
+
+- **Expected latency is roughly one poll interval (~5 s)**, plus GitHub
+  API time. A remote edit appears after the next poll, never
+  sub-second. Typing does not stream; whole blocks do.
+- **Offline peers:** their blocks stay in the document, marked stale
+  (the editor exposes `staleBlockIds()`); the peer drops from live
+  presence after 30 s without a heartbeat. When they return they
+  re-sync from one poll. A failed poll marks the session offline,
+  keeps the last known presence and document untouched, and retries
+  on the next poll — local editing keeps working throughout.
+- **Conflict cases:** different blocks never interfere. The same block
+  edited by two peers resolves whole-block: the newer version wins
+  and the losing version is recorded in a visible conflict note (with
+  its text) — it is never silently dropped, but it is NOT merged and
+  NOT auto-restored. A delete that loses to a newer edit keeps the
+  block and is recorded the same way. Two peers inserting at the same
+  index converge to the same order, but that order is by placement key,
+  not by who typed first.
+- **This is NOT Google Docs parity.** No character-level OT, no
+  sub-second latency, no server, no simultaneous typing in the same
+  block. Do not claim it. Live GitHub round-trips have NOT run (no
+  repos exist yet, same as the rest of the app) — the relay, engine,
+  and editor wiring are proven only against the in-memory fake GitHub.
+- **Poll cost:** every peer polls every 5 s (list + one read per peer
+  + one write). With many peers this is chatty against the 5,000/hr
+  authenticated rate limit; sessions are per-site and small by design.
+- **Wired into the UI by the feature-round-2 integration pass
+  (2026-11-21, see below):** the editor renders cursor marks and
+  conflict notes and offers a Join/Leave control; `EditorState`
+  exposes `collabPeers`, `collabConflicts`, `staleBlockIds()`, and
+  `describePeerCursors()` for it.
+- **One real bug found and fixed in the implementation (not the
+  tests):** `noteLocalChange` originally advanced `lastSynced` on
+  every local edit, which made genuine same-block conflicts
+  invisible (the remote op no longer post-dated the "synced"
+  version). `lastSynced` now advances only when a remote state is
+  merged and the contents agree.
+
+## Verified state (this workstream)
+
+- `npx tsc -p tsconfig.json --noEmit`: **clean at final check** (the
+  sibling errors seen mid-work — `tests/html-import.test.ts`,
+  `tests/tables-lists.test.ts` — were fixed by their owners while this
+  ran; no collab file was ever implicated).
+- `npm run build`: passes (tsc + asset copy).
+- `npm test`: **583 tests, 581 pass, 2 fail — both failures are the
+  sibling table/list workstream's, not collab's** ("malformed HTML:
+  unclosed tags degrade gracefully and never throw",
+  "slash menu lists list and table once each (P1 dedupe)"). All 28
+  collab tests pass inside the full run, and standalone:
+  **28 pass, 0 fail** (`node --test dist/tests/collab.test.js
+  dist/tests/collab-relay.test.js dist/tests/collab-editor.test.js`).
+
+# Feature round 2 — integration wiring, 2026-11-21
+
+The four round-2 feature agents finished (collab engine, tables/lists,
+domain-claim-open, HTML importer) at 583 pass / 0 fail. This pass wires
+all four into the running app. No new features beyond the wiring below;
+no push to GitHub; seed tree and /tmp/repush-seed.py untouched.
+
+## 1. Domain claim → editor (main.ts + panels.ts + editor-ui.ts)
+
+- The Domains panel now has the claim form: Terms checkbox
+  (`#an-domain-terms`), Claim button (`#an-domain-claim-btn`), and —
+  for guests — the exact refusal "Sign in with GitHub first to claim a
+  domain" rendered in the panel (`#an-domain-signin-note`).
+- `PanelHostOptions.onClaimDomain` (panels.ts) is wired in main.ts to
+  `claimDomainAndOpenSite` with the signed-in user's OWN token + login
+  from the session (keyring-backed after sign-in) and the shared
+  `githubFetch`. Not signed in → the flow refuses with the exact
+  message and makes no GitHub call (the flow itself guarantees this;
+  the panel surfaces the returned reason verbatim).
+- The `onSiteOpened` hook (`handleSiteOpened` in main.ts) loads
+  `opened.doc` into the EditorUI for `opened.domain` and switches to
+  the builder; `EditorUI.showSiteOpened` shows the pending-claim state
+  ("Your claim is filed and waiting for the register bot — usually 5
+  to 10 seconds") and never says the domain is registered. The
+  reader's current document is updated too, so closing the editor
+  shows the new site. A hook failure is reported on the claim result
+  as `hookError` and surfaced in the panel status; the claim still
+  stands.
+- `ensureEditorUi()` was hoisted to module level in main.ts so the
+  edit toggle and the claim hook share one EditorUI construction; the
+  GitHub fetch adapter is likewise shared (`githubFetch`), and the
+  HTML importer gets a plain unauthenticated fetch (`htmlFetch`).
+
+## 2. HTML importer UI (editor-ui.ts + index.html)
+
+- Editor bar gains "Import HTML (.html)" file picker
+  (`#html-import-input`, same pattern as the WXR entry) and an
+  "Import HTML from URL" field + button (`#html-import-url`,
+  `#html-import-url-btn`).
+- File import: `importHtml` on the file text; URL import:
+  `importHtmlFromUrl` with the app's fetch. Both append blocks to the
+  current document through `insertBlock` (so a live collab session
+  broadcasts them like any other local edit); an empty document also
+  adopts the imported title/nav. Status shows imported/skipped counts
+  plainly plus the importer's notes. A read failure, a fetch failure,
+  or malformed input never throws — the status line says so.
+- Role-gated like WXR import (viewer cannot import).
+
+## 3. Collab UI surface (editor-ui.ts + editor.ts)
+
+- The editor bar gains a collab strip (`#collab-bar`): Join / Leave
+  buttons, a status line (`#collab-status`), and the peer list
+  (`#collab-peers`, "who is in this site now", self marked "(you)").
+- Peer cursor/selection marks render in the canvas on the block the
+  peer's caret is in (`describePeerCursors`, self excluded, names +
+  deterministic colours, stale peers flagged "(away)"). Conflict
+  notes render on the losing block (`describeConflict`). Blocks whose
+  last writer is stale get a stale note (`staleBlockIds()`).
+- Join refuses loudly with no token — the engine's message is
+  surfaced in both the editor status and the collab strip, never
+  swallowed. Leave stops timers, deletes my relay state, and deletes
+  the branch when I was the last peer; blocks stay.
+- The surface re-renders after every edit and on a 2 s timer while
+  joined (remote polls arrive without a local edit). My caret is
+  shared on focus of a text block / list item / table cell only — a
+  write per keystroke would spam the relay. Opening a different
+  domain ends the old session; re-opening the same domain keeps it.
+- **One real bug found and fixed in the implementation (not the
+  tests):** the peer list stayed empty until the first poll (~5 s)
+  because `onPresence` only fires inside `pollOnce`. `startCollab`
+  now seeds `collabPeers` with self immediately after joining; polls
+  refresh it from then on.
+
+## 4. Data:image fix (inline.ts)
+
+- `isSafeUrl` now allows exactly
+  `data:image/png|jpeg|gif|webp;base64,<b64>` — the HTML importer's
+  image allow-list, mirrored character-for-character. SVG data: URLs
+  stay refused (they can carry script), as do all other data: shapes
+  (parameters, whitespace, non-base64, wrong type). Imported data:
+  images now render as real `<img>` in the shared renderer instead of
+  "[image blocked]".
+
+## 5. Canvas table layout (styles.css)
+
+- `.an-ed-table-row` is now a grid
+  (`repeat(auto-fit, minmax(120px, 1fr))`) so table cells sit
+  side-by-side instead of stacking vertically. Editor-only classes;
+  the reader/preview rendering (`.an-table`) is untouched.
+
+## Verified state (this pass)
+
+- `npm run build`: passes (tsc + asset copy).
+- `npm test`: **596 pass, 0 fail** (583 baseline + 13 new: 2 renderer
+  data-URL tests, 1 panels claim-form test, 10
+  `tests/integration-round2.test.ts` — HTML import file/URL/malformed,
+  collab join-refusal / join-peers-cursor-conflict-leave / stale flags,
+  claim → editor hook + signed-out refusal, canvas table grid).
+- Two test bugs found and fixed in the new battery (not the
+  implementation): `??` in the test setup turned an explicit `null`
+  token/login into the defaults (the "no token" test was secretly
+  joining as alice and leaking live poll timers, which hung the whole
+  suite run), and the collab assertions read `#editor-status` while
+  the joined state lives in `#collab-status`.

@@ -28,7 +28,56 @@ export const CLAIM_COPY = {
   registeredHeading: "This domain is yours",
   pendingHeading: "Your claim is being processed",
   rejectedHeading: "This claim was refused",
+  /** Shown the moment a claim is filed and the site opens: the
+   *  editor is already on the new domain, and the registry entry is
+   *  still pending until the register bot closes the issue. */
+  siteOpenedHeading: "Your site is open — start building",
+  siteOpenedPendingNote:
+    "Your claim is filed and waiting for the register bot — usually 5 to 10 seconds. " +
+    "Your site is already open in the editor, so start building now; the domain shows as registered once the bot closes the issue.",
 } as const;
+
+/** View-model for the moment a claim lands and the editor opens on
+ *  the claimed domain. Says plainly that the claim is pending (the
+ *  bot has not processed it yet) while the site is already editable. */
+export interface SiteOpenedViewModel {
+  heading: string;
+  message: string;
+  domain: string;
+  repo: string;
+  repoUrl: string;
+  issueUrl: string;
+  pendingNote: string;
+  /** True when the site repo already existed (a retry, or a repo the
+   *  user already had) and was reused. */
+  reusedRepo: boolean;
+  /** True when the repo already had a site and that site was kept. */
+  keptExistingSite: boolean;
+}
+
+export function buildSiteOpenedViewModel(opened: {
+  domain: string;
+  repo: string;
+  repoUrl: string;
+  issueUrl: string;
+  alreadyExistedRepo: boolean;
+  alreadySeeded: boolean;
+}): SiteOpenedViewModel {
+  const kept = opened.alreadySeeded;
+  return {
+    heading: CLAIM_COPY.siteOpenedHeading,
+    message: kept
+      ? `"${opened.domain}" is claimed and your existing site in ${opened.repo} is open in the editor — nothing was overwritten.`
+      : `"${opened.domain}" is claimed and a starter site is open in the editor. Replace the hero with your own title and start writing.`,
+    domain: opened.domain,
+    repo: opened.repo,
+    repoUrl: opened.repoUrl,
+    issueUrl: opened.issueUrl,
+    pendingNote: CLAIM_COPY.siteOpenedPendingNote,
+    reusedRepo: opened.alreadyExistedRepo,
+    keptExistingSite: kept,
+  };
+}
 
 export interface ClaimStep {
   step: number;
@@ -59,7 +108,8 @@ export function claimSteps(): ClaimStep[] {
     {
       step: 4,
       title: "Start building",
-      description: "Once the issue closes, the domain is yours. Sign in and open the builder.",
+      description:
+        "Your site opens in the editor right away, on the domain you just claimed — while the register bot files the domain in the background (usually 5 to 10 seconds).",
     },
   ];
 }

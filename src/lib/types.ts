@@ -40,9 +40,29 @@ export type BlockType =
   | "link"
   | "docs-sidebar"
   | "gallery"
-  | "app";
+  | "app"
+  | "list"
+  | "table";
 
 import type { InlineRun } from "./inline.js";
+
+/** One item of a "list" block. Items carry typed inline runs (same
+ *  formatting as text blocks: bold/italic/links) and nest via
+ *  `children` — a list is at least 2 levels deep. `text` is always kept
+ *  in sync with plainText(runs), exactly like BlockNode text/runs. */
+export interface ListItem {
+  text?: string;
+  runs?: InlineRun[];
+  children?: ListItem[];
+}
+
+/** One cell of a "table" block. Typed inline runs, like a list item —
+ *  never raw HTML. `text` is always kept in sync with
+ *  plainText(runs). */
+export interface TableCell {
+  text?: string;
+  runs?: InlineRun[];
+}
 
 /** A semantic block. No raw HTML/JS is ever allowed in a block — the
  *  renderer whitelists these types and escapes all text. `["app", ...]`
@@ -70,6 +90,14 @@ export interface BlockNode {
    *  everywhere. A block listed only on "desktop" is hidden on tablet
    *  and mobile, and vice versa. */
   visibleOn?: Array<"desktop" | "tablet" | "mobile">;
+  /** "list": "ul" (bulleted) or "ol" (numbered). Absent = "ul". */
+  listStyle?: "ul" | "ol";
+  /** "list": the items, nested via ListItem.children. */
+  listItems?: ListItem[];
+  /** "table": rows of cells; every row has the same length. */
+  rows?: TableCell[][];
+  /** "table": the first row renders as <th scope="col">. Absent = true. */
+  headerRow?: boolean;
   /** Image focal point, 0-100 on each axis (percent). */
   focalPoint?: { x: number; y: number };
   /** "Mark as decorative" (Gutenberg): alt is empty, screen readers skip it. */

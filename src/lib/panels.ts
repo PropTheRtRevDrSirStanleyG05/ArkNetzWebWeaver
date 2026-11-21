@@ -72,6 +72,11 @@ export interface PanelHostOptions {
    *  startGitHubSignIn). The panel only renders the button; the shell
    *  owns the flow. Absent in tests — the button then says so. */
   onSignInWithGitHub?: () => void;
+  /** Domains panel: file a claim for a domain (the shell's
+   *  claimDomainAndOpenSite call). Returns the plain-language outcome
+   *  for the status line — including the exact refusal when the user
+   *  is not signed in. Absent in tests — the button then says so. */
+  onClaimDomain?: (domain: string, acceptedTerms: boolean) => Promise<{ ok: boolean; message: string }>;
 }
 
 /** Per-mount mutable panel state (keypair, opened vault label + handle). */
@@ -261,6 +266,7 @@ export async function renderPanelHtml(
     }
     case "domains": {
       const steps = claimSteps();
+      const signedIn = opts.getGithubLogin?.() != null;
       return (
         h +
         note(CLAIM_COPY.intro) +
@@ -269,8 +275,11 @@ export async function renderPanelHtml(
           `<ol>${steps.map((s) => `<li><strong>${esc(s.title)}</strong> — ${esc(s.description)}</li>`).join("")}</ol>
            <label>Domain <input id="an-domain-name" type="text" placeholder="computers.edu"></label>
            <button id="an-domain-check-btn" type="button">Check availability</button>
+           <label><input id="an-domain-terms" type="checkbox"> ${esc(CLAIM_COPY.termsLabel)}</label>
+           <button id="an-domain-claim-btn" type="button">${esc(CLAIM_COPY.submitLabel)}</button>
            <div id="an-domain-status" role="status">No claim in progress.</div>
-           <p class="an-note">Registration is completely open — no account-age minimum, no per-user limit. Claims go through a GitHub Issue to the central registry repos, which do not exist yet, so claiming is checked locally until they do.</p>`,
+           ${signedIn ? "" : `<p class="an-note" id="an-domain-signin-note">Sign in with GitHub first to claim a domain</p>`}
+           <p class="an-note">Registration is completely open — no account-age minimum, no per-user limit. Availability is checked against the registry shard; claiming files a REGISTER issue, creates your site repo, and opens the site in the editor while the register bot files the domain (usually 5 to 10 seconds).</p>`,
         )
       );
     }
@@ -483,6 +492,29 @@ export function wirePanel(
     });
   }
   if (panelId === "domains") {
+    $("an-domain-claim-btn")?.addEventListener("click", () => {
+      const raw = ($("an-domain-name") as HTMLInputElement | null)?.value ?? "";
+      const status = $("an-domain-status");
+      const domain = normalizeDomain(raw);
+      if (!domain) {
+        if (status) status.textContent = "Enter a domain, e.g. computers.edu.";
+        return;
+      }
+      const terms = ($("an-domain-terms") as HTMLInputElement | null)?.checked ?? false;
+      if (!opts.onClaimDomain) {
+        if (status) status.textContent = "Claiming is not wired in this view — open the app shell to claim a domain.";
+        return;
+      }
+      if (status) status.textContent = `Claiming ${domain}…`;
+      void opts
+        .onClaimDomain(domain, terms)
+        .then((r) => {
+          if (status) status.textContent = r.message;
+        })
+        .catch((e) => {
+          if (status) status.textContent = e instanceof Error ? e.message : String(e);
+        });
+    });
     $("an-domain-check-btn")?.addEventListener("click", () => {
       const raw = ($("an-domain-name") as HTMLInputElement | null)?.value ?? "";
       const status = $("an-domain-status");

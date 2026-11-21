@@ -34,6 +34,10 @@ import {
 import type { IaAccountStore } from "./lib/ia-settings.js";
 import { prepareImageForUpload } from "./lib/media-edit.js";
 import { siteRepoName } from "./lib/publish.js";
+import type { GithubFetchFn } from "./lib/publish.js";
+import { claimDomainAndOpenSite } from "./lib/domains.js";
+import type { OpenedSite } from "./lib/domains.js";
+import { buildSiteOpenedViewModel } from "./lib/domains-ui.js";
 import {
   BookmarkManager,
   TabManager,
@@ -92,6 +96,28 @@ let panelsRefreshNav: (() => void) | null = null;
 // View and Edit always show the same renderer output.
 let currentDoc: SiteDocument = JSON.parse(JSON.stringify(DEMO_SITE)) as SiteDocument;
 let editorUi: EditorUI | null = null;
+
+/** Build the EditorUI once (the edit toggle and the claim hook share
+ *  it): the signed-in GitHub token/login come from the session
+ *  variables, the IA keys from the settings unlock. */
+function ensureEditorUi(): EditorUI {
+  if (!editorUi) {
+    editorUi = new EditorUI($("editor"), {
+      getIaKeys: () => iaKeys,
+      iaQueue,
+      iaFetch: async (url, init) => {
+        const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
+        return { status: res.status, text: () => res.text() };
+      },
+      getGithubToken: () => githubToken,
+      getGithubLogin: () => githubLogin,
+      getSiteRepo: (domain: string) => siteRepoName(domain),
+      githubFetch,
+      htmlFetch,
+    });
+  }
+  return editorUi;
+}
 /** Save-bridge for the site the reader is showing: one bridge per domain,
  *  sessions revoked on every re-render so a removed iframe's sid dies
  *  with it. */
@@ -99,6 +125,26 @@ let appBridge: AppSaveBridge | null = null;
 let appBridgeSids: string[] = [];
 let uninstallAppBridge: (() => void) | null = null;
 let iaStore: IaAccountStore = createMemoryIaAccountStore();
+
+/** The GitHub API fetch, shared by the editor (Publish / collab)
+ *  and the domain claim flow: plain fetch, no auth header of its
+ *  own — the caller passes the token in init.headers where the API
+ *  needs it. */
+const githubFetch: GithubFetchFn = async (url, init) => {
+  const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
+  return {
+    status: res.status,
+    json: () => res.json() as Promise<unknown>,
+    text: () => res.text(),
+  };
+};
+
+/** Plain fetch for the HTML importer's URL import: no auth, no
+ *  GitHub — any public page. */
+const htmlFetch = async (url: string) => {
+  const res = await fetch(url);
+  return { ok: res.ok, status: res.status, text: () => res.text() };
+};
 
 function cloneDoc(doc: SiteDocument): SiteDocument {
   return JSON.parse(JSON.stringify(doc)) as SiteDocument;
@@ -410,6 +456,21 @@ function wireSettings(): void {
   refreshGithubStatus();
 }
 
+/** The claim flow's onSiteOpened hook: a claim just succeeded, so
+ *  load the opened document into the editor for the claimed domain
+ *  and switch to the builder. The editor shows the pending-claim
+ *  state (EditorUI.showSiteOpened) — the claim is pending until
+ *  register.yml closes the REGISTER issue, never "registered". The
+ *  reader's current document is updated too, so closing the editor
+ *  shows the new site instead of the old one. */
+function handleSiteOpened(opened: OpenedSite): void {
+  currentDoc = cloneDoc(opened.doc);
+  const ui = ensureEditorUi();
+  ($("reader") as HTMLElement).hidden = true;
+  ui.showSiteOpened(opened);
+  ($("editor") as HTMLElement).scrollIntoView({ block: "start" });
+}
+
 async function init(): Promise<void> {
   await tabs.load();
   await bookmarks.load();
@@ -479,6 +540,26 @@ async function init(): Promise<void> {
     getLinkedBackends: () => appInstance.getLinkedBackends(),
     getLastMirrorAttempts: () => appInstance.getLastMirrorAttempts(),
     onSignInWithGitHub: () => startGitHubSignIn(),
+    onClaimDomain: async (domain, acceptedTerms) => {
+      // The claim flow takes the signed-in user's OWN token + login
+      // from this session (keyring-backed after sign-in) — never a
+      // shared or master token. Not signed in → the flow refuses
+      // with the exact message and makes no GitHub call.
+      const result = await claimDomainAndOpenSite({
+        domainInput: domain,
+        token: githubToken,
+        login: githubLogin,
+        acceptedTerms,
+        fetchFn: githubFetch,
+        onSiteOpened: handleSiteOpened,
+      });
+      if (!result.ok) return { ok: false, message: result.reason };
+      const vm = buildSiteOpenedViewModel(result);
+      const hookNote = result.hookError
+        ? ` (The claim stands, but opening the site in the editor failed: ${result.hookError})`
+        : "";
+      return { ok: true, message: `${vm.heading}: ${vm.message} ${vm.pendingNote}${hookNote}` };
+    },
     showReader: () => {
       ($("editor") as HTMLElement).hidden = true;
       ($("reader") as HTMLElement).hidden = false;
@@ -538,29 +619,9 @@ async function init(): Promise<void> {
   // The editor edits a clone; closing it re-renders the reader from the
   // edited copy through the SAME renderer, so View and Edit never diverge.
   ($("edit-toggle-btn") as HTMLButtonElement).onclick = () => {
-    if (!editorUi) {
-      editorUi = new EditorUI($("editor"), {
-        getIaKeys: () => iaKeys,
-        iaQueue,
-        iaFetch: async (url, init) => {
-          const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
-          return { status: res.status, text: () => res.text() };
-        },
-        getGithubToken: () => githubToken,
-        getGithubLogin: () => githubLogin,
-        getSiteRepo: (domain: string) => siteRepoName(domain),
-        githubFetch: async (url, init) => {
-          const res = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
-          return {
-            status: res.status,
-            json: () => res.json() as Promise<unknown>,
-            text: () => res.text(),
-          };
-        },
-      });
-    }
+    const ui = ensureEditorUi();
     ($("reader") as HTMLElement).hidden = true;
-    editorUi.open(currentDoc);
+    ui.open(currentDoc);
     // B1 (belt & braces with the grid placement in styles.css): the
     // editor replaces the reader in the same grid cell, and the view
     // scrolls to it so a first-time user never sees a blank page.

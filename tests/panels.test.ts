@@ -93,6 +93,24 @@ test("panels: offline offers a real save button; domains lists the claim steps",
   assert.match(domains, /no account-age minimum/);
 });
 
+test("panels: domains renders the claim form (terms + claim button) and the exact signed-out refusal for guests", async () => {
+  const app = createArkNetzApp({ fetchFn: throwingFetch });
+  const state = createPanelState();
+  const guest = await renderPanelHtml(app, "domains", state, opts);
+  assert.match(guest, /an-domain-terms/);
+  assert.match(guest, /an-domain-claim-btn/);
+  assert.match(guest, /Claim this domain/);
+  assert.match(guest, /Sign in with GitHub first to claim a domain/);
+  // Signed in: the refusal note is gone (the claim button stays —
+  // the flow itself still refuses loudly without a token).
+  const signedIn = await renderPanelHtml(app, "domains", state, {
+    ...opts,
+    getGithubLogin: () => "alice",
+  });
+  assert.doesNotMatch(signedIn, /an-domain-signin-note/);
+  assert.match(signedIn, /an-domain-claim-btn/);
+});
+
 test("panels: moderation hides the admin panel from guests; accounts show the keyring state", async () => {
   const app = createArkNetzApp({ fetchFn: throwingFetch });
   const state = createPanelState();

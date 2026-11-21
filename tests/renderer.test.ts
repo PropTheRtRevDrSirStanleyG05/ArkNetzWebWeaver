@@ -30,6 +30,35 @@ test("isSafeUrl allows arknetz: deep links and IA/raw hosts, nothing else", () =
   assert.equal(isSafeUrl("javascript:alert(1)"), false);
 });
 
+test("isSafeUrl allows data:image/png|jpeg|gif|webp;base64 (HTML importer's images) and still refuses SVG data: URLs", () => {
+  const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  assert.equal(isSafeUrl(png), true);
+  assert.equal(isSafeUrl("data:image/jpeg;base64,/9j/4AAQSkZJRg=="), true);
+  assert.equal(isSafeUrl("data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="), true);
+  assert.equal(isSafeUrl("data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA=="), true);
+  // SVG data: URLs can carry script — refused, as is every other
+  // data: shape (parameters, whitespace, non-base64, wrong type).
+  assert.equal(isSafeUrl("data:image/svg+xml;base64,PHN2Zz48c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ+PC9zdmc+"), false);
+  assert.equal(isSafeUrl("data:image/svg+xml;utf8,<svg onload=alert(1)>"), false);
+  assert.equal(isSafeUrl("data:image/png;base64,iVBOR w0KGgo="), false);
+  assert.equal(isSafeUrl("data:image/png;charset=utf-8;base64,iVBORw0KGgo="), false);
+  assert.equal(isSafeUrl("data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="), false);
+  assert.equal(isSafeUrl("data:image/png,iVBORw0KGgo="), false);
+});
+
+test("a data: PNG image renders as <img>; a data: SVG image is still blocked", () => {
+  const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const html = renderBlock({ type: "img", src: png, alt: "Imported photo" });
+  assert.match(html, /<img src="data:image\/png;base64,/);
+  assert.doesNotMatch(html, /blocked/);
+  const svg = "data:image/svg+xml;base64,PHN2Zz48c2NyaXB0PmFsZXJ0KDEpPC9zY3JpcHQ+PC9zdmc+";
+  assert.match(renderBlock({ type: "img", src: svg, alt: "SVG" }), /blocked: unsafe source/);
+  // Note: isSafeUrl is the renderer's ONE allow-list, so a data:image
+  // src is also accepted for video/audio — harmless there (a browser
+  // cannot play an image as video), and the task's allow-list is the
+  // renderer's, not the img block's.
+});
+
 test("app blocks render only as a sandboxed iframe, never inline HTML", () => {
   const html = renderBlock({ type: "app", appSrcdoc: "<script>alert(1)</script>" });
   assert.match(html, /<iframe[^>]*sandbox="allow-scripts allow-pointer-lock"/);

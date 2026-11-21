@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <title>Hostile Page</title>
+  <style>body { color: red; }</style>
+</head>
+<body>
+  <h1>Still Here</h1>
+  <script>alert("pwned");</script>
+  <p onclick="alert(1)" onmouseover="steal()">A paragraph with event handlers.</p>
+  <p>Click <a href="javascript:alert(2)">this javascript link</a> and <a href="https://evil.example/x">this tracker link</a>.</p>
+  <iframe src="https://evil.example/embed"></iframe>
+  <object data="https://evil.example/x.swf"></object>
+  <embed src="https://evil.example/x.swf">
+  <form action="https://evil.example/submit"><input type="text" name="q"><button>Go</button></form>
+  <p>Safe text after all the hostile content.</p>
+  <img src="https://tracker.example/pixel.png" alt="tracker">
+</body>
+</html>

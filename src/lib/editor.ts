@@ -12,6 +12,37 @@ import type { FormatPatch, InlineRun } from "./inline.js";
 import { compressJson } from "./zstd.js";
 import { publishSite } from "./publish.js";
 import type { GithubFetchFn, PublishResult } from "./publish.js";
+import { siteRepoName } from "./publish.js";
+import { CollabRelay } from "./collab/relay.js";
+import { CollabSession } from "./collab/session.js";
+import { applyBlockOps, diffBlocks, mergeSnapshot } from "./collab/merge.js";
+import type { PlacementKey } from "./collab/merge.js";
+import type {
+  BlockOp,
+  BlockVersion,
+  CollabPeer,
+  CollabStateFile,
+  ConflictNote,
+  CursorPosition,
+  LocalSnapshot,
+} from "./collab/index.js";
+import { colourForLogin } from "./collab/index.js";
+
+export interface CollabStartOptions {
+  /** The acting user's OWN GitHub OAuth token. Null = refuse. */
+  token: string | null;
+  owner: string;
+  /** Site repo name; defaults to siteRepoName(doc.domain). */
+  repo?: string | null;
+  /** GitHub login of the joining user. */
+  login: string;
+  fetchFn: GithubFetchFn;
+  pollMs?: number;
+  heartbeatMs?: number;
+  now?: () => number;
+  /** False = no timers (tests drive pollOnce by hand). */
+  autoPoll?: boolean;
+}
 
 export interface PageRecord {
   slug: string;
@@ -53,6 +84,31 @@ export class EditorState {
   /** True once the document differs from the last saved revision. */
   dirty = false;
 
+  // --- Real-time collaboration (see src/lib/collab/README.md) -------
+  // The collab session is optional: null until startCollab() joins.
+  // Blocks only — header/footer/nav/pages are NOT synced (a peer's
+  // nav edit stays local until Publish). Remote edits apply through
+  // mergeSnapshot/applyBlockOps; local edits broadcast by diffing
+  // against lastBroadcast. While applyingRemote is set, local
+  // mutations are not re-broadcast (no echo loop).
+  collabSession: CollabSession | null = null;
+  /** Conflict notes LWW recorded, newest last — the UI shows these. */
+  collabConflicts: ConflictNote[] = [];
+  /** Last presence list reported by the session (live + stale). */
+  collabPeers: CollabPeer[] = [];
+  /** True after a failed poll/write, until a poll succeeds again. */
+  collabOffline = false;
+  collabError: string | null = null;
+  private collabLogin = "";
+  private collabNow: () => number = () => Date.now();
+  private collabVersions = new Map<string, BlockVersion>();
+  private collabPlacement = new Map<string, PlacementKey>();
+  private collabDeleted = new Map<string, BlockVersion>();
+  private collabLastSynced = new Map<string, number>();
+  private collabLastBroadcast = new Map<string, { json: string; updatedAt: number }>();
+  private collabOpCounter = { n: 0 };
+  private applyingRemote = false;
+
   constructor(doc: SiteDocument) {
     this.doc = doc;
     this.doc.blocks.forEach((b) => {
@@ -72,12 +128,290 @@ export class EditorState {
     return this.doc.blocks.find((b) => b.id === this.selectedBlockId);
   }
 
+  // --- Collaboration ---------------------------------------------------
+
+  /** Join the collab session for this site (one session per site:
+   *  the relay branch derives from the domain). Throws when the
+   *  token is missing or the relay is unreachable — the caller must
+   *  surface that instead of showing a fake "collaborating" state. */
+  async startCollab(options: CollabStartOptions): Promise<void> {
+    if (this.collabSession) throw new Error("collab session already started — stop it first");
+    if (!options.token) {
+      throw new Error(
+        "Collab needs your own GitHub token — sign in with GitHub first. Collab never uses a shared or master token.",
+      );
+    }
+    if (!options.login) throw new Error("collab session needs a GitHub login");
+    this.collabLogin = options.login;
+    this.collabNow = options.now ?? (() => Date.now());
+    this.collabVersions = new Map();
+    this.collabPlacement = new Map();
+    this.collabDeleted = new Map();
+    this.collabLastSynced = new Map();
+    this.collabLastBroadcast = new Map();
+    this.collabOpCounter = { n: 0 };
+    this.collabConflicts = [];
+    this.collabOffline = false;
+    this.collabError = null;
+    // Pre-session blocks are anchors: version 0, no placement key,
+    // so any real edit (local or remote) wins over them and concurrent
+    // inserts order deterministically around them.
+    for (const block of this.doc.blocks) {
+      const id = block.id as string;
+      this.collabVersions.set(id, { updatedAt: 0, author: "" });
+      this.collabLastBroadcast.set(id, { json: JSON.stringify(block), updatedAt: 0 });
+    }
+    const relay = new CollabRelay({
+      owner: options.owner,
+      repo: options.repo ?? siteRepoName(this.doc.domain),
+      domain: this.doc.domain,
+      token: options.token,
+      fetchFn: options.fetchFn,
+    });
+    const session = new CollabSession({
+      relay,
+      login: options.login,
+      getLocalSnapshot: () => this.collabSnapshot(),
+      onRemoteStates: (states) => this.applyRemoteStates(states),
+      onPresence: (peers) => {
+        this.collabPeers = peers;
+      },
+      onError: (err) => {
+        this.collabOffline = true;
+        this.collabError = err.message;
+      },
+      pollMs: options.pollMs,
+      heartbeatMs: options.heartbeatMs,
+      now: this.collabNow,
+      autoPoll: options.autoPoll,
+    });
+    await session.join();
+    this.collabSession = session;
+    this.collabOffline = false;
+    // I am present from the moment I join — seed the peer list with
+    // myself now, instead of leaving it empty until the first poll
+    // (~5 s) reports me back. The poll refreshes this list (and adds
+    // remote peers) from then on.
+    this.collabPeers = [
+      {
+        login: options.login,
+        colour: colourForLogin(options.login),
+        lastHeartbeat: this.collabNow(),
+        cursor: null,
+        stale: false,
+      },
+    ];
+  }
+
+  /** Graceful leave: stops timers, deletes my relay state file, and
+   *  deletes the collab branch when I was the last peer. My blocks
+   *  stay in the document. */
+  async stopCollab(): Promise<{ branchDeleted: boolean }> {
+    const session = this.collabSession;
+    this.collabSession = null;
+    this.collabPeers = [];
+    if (!session) return { branchDeleted: false };
+    return session.leave();
+  }
+
+  /** My current snapshot for the relay: full block list + versions +
+   *  placement + tombstones. The wire carries snapshots, not an op
+   *  log, so a peer that missed ops still converges. */
+  collabSnapshot(): LocalSnapshot {
+    return {
+      blocks: this.doc.blocks.map((b) => JSON.parse(JSON.stringify(b)) as BlockNode),
+      versions: new Map(this.collabVersions),
+      placement: new Map(this.collabPlacement),
+      deleted: new Map(this.collabDeleted),
+    };
+  }
+
+  /** Share my cursor with the session (propagates on the next write). */
+  setLocalCursor(cursor: CursorPosition | null): void {
+    this.collabSession?.setCursor(cursor);
+  }
+
+  /** Block ids whose last writer is currently stale (>30 s without a
+   *  heartbeat). The UI marks these blocks stale; they stay put. */
+  staleBlockIds(): Set<string> {
+    const session = this.collabSession;
+    if (!session) return new Set();
+    return session.engine.staleBlockIds(this.collabSnapshot());
+  }
+
+  /** Apply remote block ops to the document (LWW per block). Remote
+   *  application never re-broadcasts. Returns what changed and any
+   *  conflicts recorded (newer version kept, loser noted). */
+  applyRemoteBlockOps(ops: BlockOp[]): { changed: boolean; conflicts: ConflictNote[] } {
+    if (ops.length === 0) return { changed: false, conflicts: [] };
+    this.applyingRemote = true;
+    try {
+      const result = applyBlockOps(
+        {
+          blocks: this.doc.blocks,
+          versions: this.collabVersions,
+          placement: this.collabPlacement,
+          deleted: this.collabDeleted,
+          lastSynced: this.collabLastSynced,
+        },
+        ops,
+        this.collabNow(),
+      );
+      this.adoptMergeResult(result, ops);
+      return { changed: result.changed, conflicts: result.conflicts };
+    } finally {
+      this.applyingRemote = false;
+    }
+  }
+
+  /** Apply peers' state files (the path the poll loop uses). States
+   *  are merged in login order so the result is deterministic. */
+  applyRemoteStates(states: CollabStateFile[]): { changed: boolean; conflicts: ConflictNote[] } {
+    if (states.length === 0) return { changed: false, conflicts: [] };
+    this.applyingRemote = true;
+    try {
+      let changed = false;
+      const conflicts: ConflictNote[] = [];
+      const sorted = [...states].sort((a, b) => (a.login < b.login ? -1 : a.login > b.login ? 1 : 0));
+      for (const state of sorted) {
+        const result = mergeSnapshot(
+          {
+            blocks: this.doc.blocks,
+            versions: this.collabVersions,
+            placement: this.collabPlacement,
+            deleted: this.collabDeleted,
+            lastSynced: this.collabLastSynced,
+          },
+          state,
+          this.collabNow(),
+        );
+        this.adoptMergeResult(result);
+        // Blocks both sides now agree on (same content) advance the
+        // shared version, so a later edit is not misread as a
+        // conflict against a version the other side never saw.
+        for (const block of result.blocks) {
+          const id = block.id as string;
+          const remoteVersion = state.versions[id];
+          const localVersion = result.versions.get(id);
+          if (!remoteVersion || !localVersion) continue;
+          const remoteBlock = state.blocks.find((b) => b.id === id);
+          if (remoteBlock && JSON.stringify(remoteBlock) === JSON.stringify(block)) {
+            const shared = Math.min(localVersion.updatedAt, remoteVersion.updatedAt);
+            const prev = this.collabLastSynced.get(id) ?? 0;
+            if (shared > prev) this.collabLastSynced.set(id, shared);
+          }
+        }
+        changed = changed || result.changed;
+        conflicts.push(...result.conflicts);
+      }
+      return { changed, conflicts };
+    } finally {
+      this.applyingRemote = false;
+    }
+  }
+
+  private adoptMergeResult(
+    result: {
+      blocks: BlockNode[];
+      versions: Map<string, BlockVersion>;
+      placement: Map<string, PlacementKey>;
+      deleted: Map<string, BlockVersion>;
+      conflicts: ConflictNote[];
+      changed: boolean;
+    },
+    ops?: BlockOp[],
+  ): void {
+    this.doc.blocks = result.blocks;
+    this.collabVersions = result.versions;
+    this.collabPlacement = result.placement;
+    this.collabDeleted = result.deleted;
+    if (ops) {
+      for (const op of ops) {
+        const v = result.versions.get(op.blockId);
+        if (v && v.updatedAt === op.updatedAt) {
+          const prev = this.collabLastSynced.get(op.blockId) ?? 0;
+          if (op.updatedAt > prev) this.collabLastSynced.set(op.blockId, op.updatedAt);
+        }
+        if (op.kind === "delete") {
+          const tomb = result.deleted.get(op.blockId);
+          if (tomb) {
+            const prev = this.collabLastSynced.get(op.blockId) ?? 0;
+            if (tomb.updatedAt > prev) this.collabLastSynced.set(op.blockId, tomb.updatedAt);
+          }
+        }
+      }
+    }
+    // Remote blocks are now part of the broadcast baseline: the next
+    // local diff must not re-broadcast them as my own ops.
+    for (const block of result.blocks) {
+      const id = block.id as string;
+      const v = result.versions.get(id);
+      this.collabLastBroadcast.set(id, {
+        json: JSON.stringify(block),
+        updatedAt: v?.updatedAt ?? 0,
+      });
+    }
+    for (const id of [...this.collabLastBroadcast.keys()]) {
+      if (!result.blocks.some((b) => b.id === id)) this.collabLastBroadcast.delete(id);
+    }
+    this.collabConflicts.push(...result.conflicts);
+    if (result.changed) this.dirty = true;
+  }
+
+  /** After a local block mutation: diff against the last broadcast
+   *  snapshot, stamp versions, and broadcast the ops (immediate relay
+   *  write of the current snapshot). No-op when no session is active
+   *  or when the change came from a remote apply. */
+  private noteLocalChange(): void {
+    const session = this.collabSession;
+    if (!session || !session.joined || this.applyingRemote) return;
+    const ops = diffBlocks(
+      this.collabLastBroadcast,
+      this.doc.blocks,
+      this.collabLogin,
+      this.collabNow(),
+      this.collabLastSynced,
+      this.collabOpCounter,
+    );
+    if (ops.length === 0) return;
+    for (const op of ops) {
+      if (op.kind === "delete") {
+        this.collabVersions.delete(op.blockId);
+        this.collabPlacement.delete(op.blockId);
+        this.collabDeleted.set(op.blockId, { updatedAt: op.updatedAt, author: op.author });
+        this.collabLastBroadcast.delete(op.blockId);
+      } else if (op.block) {
+        this.collabVersions.set(op.blockId, { updatedAt: op.updatedAt, author: op.author });
+        this.collabPlacement.set(op.blockId, {
+          updatedAt: op.updatedAt,
+          author: op.author,
+          blockId: op.blockId,
+        });
+        this.collabLastBroadcast.set(op.blockId, {
+          json: JSON.stringify(op.block),
+          updatedAt: op.updatedAt,
+        });
+      }
+      // NOTE: lastSynced is deliberately NOT advanced here. It records
+      // the version both sides have *shared*, which only advances when
+      // a remote state is merged and the contents agree (see
+      // applyRemoteStates). Advancing it on a local edit would make a
+      // genuine same-block conflict invisible: the remote op's
+      // updatedAt would no longer post-date the "synced" version.
+    }
+    void session.broadcastOps(ops).catch((err: unknown) => {
+      this.collabOffline = true;
+      this.collabError = err instanceof Error ? err.message : String(err);
+    });
+  }
+
   insertBlock(type: BlockType, index?: number, initial?: Partial<BlockNode>): BlockNode {
     const block = { ...defaultBlock(type), ...(initial ?? {}) };
     const at = index === undefined ? this.doc.blocks.length : Math.max(0, Math.min(index, this.doc.blocks.length));
     this.doc.blocks.splice(at, 0, block);
     this.selectedBlockId = block.id ?? null;
     this.dirty = true;
+    this.noteLocalChange();
     return block;
   }
 
@@ -98,6 +432,7 @@ export class EditorState {
     const [block] = this.doc.blocks.splice(i, 1) as [BlockNode];
     this.doc.blocks.splice(j, 0, block);
     this.dirty = true;
+    this.noteLocalChange();
     return true;
   }
 
@@ -108,6 +443,7 @@ export class EditorState {
     const at = Math.max(0, Math.min(index, this.doc.blocks.length));
     this.doc.blocks.splice(at, 0, block);
     this.dirty = true;
+    this.noteLocalChange();
     return true;
   }
 
@@ -117,6 +453,7 @@ export class EditorState {
     if (this.doc.blocks.length === before) return false;
     if (this.selectedBlockId === id) this.selectedBlockId = null;
     this.dirty = true;
+    this.noteLocalChange();
     return true;
   }
 
@@ -127,6 +464,7 @@ export class EditorState {
     copy.id = newBlockId();
     this.doc.blocks.splice(i + 1, 0, copy);
     this.dirty = true;
+    this.noteLocalChange();
     return copy;
   }
 
@@ -135,6 +473,7 @@ export class EditorState {
     if (!block) return false;
     Object.assign(block, patch);
     this.dirty = true;
+    this.noteLocalChange();
     return true;
   }
 
@@ -156,6 +495,7 @@ export class EditorState {
     if (plainText(runs) !== (block.text ?? "")) return false;
     setBlockRuns(block, runs);
     this.dirty = true;
+    this.noteLocalChange();
     return true;
   }
 
@@ -168,6 +508,7 @@ export class EditorState {
     if (plainText(runs) !== (block.text ?? "")) return false;
     setBlockRuns(block, runs);
     this.dirty = true;
+    this.noteLocalChange();
     return true;
   }
 
@@ -176,6 +517,7 @@ export class EditorState {
     if (!block) return false;
     setBlockRuns(block, clearLink(blockRuns(block), start, end));
     this.dirty = true;
+    this.noteLocalChange();
     return true;
   }
 

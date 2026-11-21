@@ -14,8 +14,16 @@
 // This module is pure TypeScript with an injected fetch function —
 // it makes NO real network calls and never touches GitHub directly.
 
-import type { RegistryEntry } from "./types.js";
+import type { RegistryEntry, SiteDocument } from "./types.js";
 import { decompressJson } from "./zstd.js";
+import {
+  buildStarterSiteDocument,
+  createSiteRepo,
+  openRegisterIssue,
+  registryEntryForClaim,
+  seedSiteRepo,
+} from "./site-repo.js";
+import type { GithubFetchFn } from "./publish.js";
 
 /** Starter banned-word list. A word is banned when it appears as a
  *  whole label of the domain (so `admin.edu` is refused but
@@ -739,4 +747,216 @@ export function claimStatusFor(
   if (!availability.available) return "registered";
   if (pendingClaims.some((c) => c.domain === domain && c.status === "pending")) return "pending";
   return "unclaimed";
+}
+
+// ---------------------------------------------------------------------------
+// Claim + open the site (2026-11-21): claiming a domain actually opens
+// the site in the editor.
+// ---------------------------------------------------------------------------
+
+/** Exact refusal when the user is not signed in. The flow stops
+ *  here — it never pretends, never uses a shared token, and never
+ *  makes a GitHub call. */
+export const SIGN_IN_TO_CLAIM_MESSAGE = "Sign in with GitHub first to claim a domain";
+
+/** What the editor opens once the claim is filed: the claimed
+ *  domain, its site repo, and the document now in that repo — the
+ *  seeded starter, or the existing site when the repo was reused.
+ *  The claim itself is still PENDING here: the registry entry is
+ *  what register.yml will commit when it processes the issue
+ *  (~5-10 s), and the domain only reads as registered after that.
+ *  The caller opens this in the editor immediately — the user starts
+ *  building while the bot catches up. */
+export interface OpenedSite {
+  domain: string;
+  /** e.g. arknetz-site-computers-edu */
+  repo: string;
+  /** e.g. https://github.com/alice/arknetz-site-computers-edu */
+  repoUrl: string;
+  /** The document to open in the editor. */
+  doc: SiteDocument;
+  /** The claim, in "pending" with the issue number + URL. */
+  claim: DomainClaim;
+  /** The registry entry register.yml will commit (not live yet). */
+  registryEntry: RegistryEntry;
+  issueUrl: string;
+  /** True when the site repo already existed and was reused. */
+  alreadyExistedRepo: boolean;
+  /** True when the repo already had a site.json and it was kept. */
+  alreadySeeded: boolean;
+}
+
+/** Hook the shell (coordinator) wires into the editor: called with
+ *  the opened site the moment the claim is filed and the repo is
+ *  seeded, so the editor opens on the claimed domain — never on the
+ *  welcome demo. The hook runs AFTER every GitHub write has
+ *  succeeded; if it throws, the claim still stands and the error is
+ *  reported on the result as `hookError` instead of failing the
+ *  claim. Signature for the coordinator (main.ts):
+ *    onSiteOpened: (opened: OpenedSite) => void
+ *  e.g. load opened.doc into the EditorUI for opened.domain and
+ *  switch to the builder panel. */
+export type OnSiteOpened = (opened: OpenedSite) => void;
+
+export interface ClaimAndOpenInput {
+  domainInput: string;
+  /** The signed-in user's OWN runtime OAuth token (keyring /
+   *  session). Null = not signed in: the flow refuses with
+   *  SIGN_IN_TO_CLAIM_MESSAGE and makes no GitHub call. */
+  token: string | null;
+  /** The signed-in user's GitHub login — repo owner + claimant. */
+  login: string | null;
+  /** The Terms checkbox (thread turn 33). Checked before any API call. */
+  acceptedTerms: boolean;
+  /** GitHub API fetch (injected — mocked in tests). */
+  fetchFn: GithubFetchFn;
+  /** Fired with the opened site once everything is filed + seeded. */
+  onSiteOpened?: OnSiteOpened;
+  now?: number;
+}
+
+export type ClaimAndOpenStage =
+  | "not_signed_in"
+  | "validation"
+  | "terms"
+  | "create_repo"
+  | "register_issue"
+  | "seed_site";
+
+export type ClaimAndOpenResult =
+  | (OpenedSite & {
+      ok: true;
+      /** Set when the onSiteOpened hook itself threw — the claim
+       *  still stands; the shell should surface this. */
+      hookError?: string;
+    })
+  | { ok: false; reason: string; stage: ClaimAndOpenStage };
+
+/** End-to-end claim flow:
+ *   1. Not signed in → exact refusal, stop, no GitHub calls.
+ *   2. Validate the domain (exact-string only; TLD-only and
+ *      reserved words rejected) and the Terms acceptance — both
+ *      before any API call.
+ *   3. Create the per-domain site repo `arknetz-site-<slug>` under
+ *      the user's own account with their own token (an existing
+ *      repo is reused, not an error).
+ *   4. File the REGISTER issue in the domain's hash-shard registry
+ *      repo. The claim is PENDING from here until register.yml
+ *      processes the issue — the result says so honestly.
+ *   5. Seed the repo with the starter site document (hero + h1 +
+ *      p, plus site.json); an existing site.json is kept.
+ *   6. Fire onSiteOpened with the site so the editor opens on the
+ *      claimed domain immediately.
+ *  A failure at any step stops the flow: nothing further is created,
+ *  and the reason says plainly what did and did not happen (e.g. a
+ *  seed failure reports that the repo and the issue already exist).
+ *  The result never claims the domain is registered — only the
+ *  register.yml bot can do that, when it closes the issue. */
+export async function claimDomainAndOpenSite(
+  input: ClaimAndOpenInput,
+): Promise<ClaimAndOpenResult> {
+  if (!input.token || !input.login) {
+    return { ok: false, reason: SIGN_IN_TO_CLAIM_MESSAGE, stage: "not_signed_in" };
+  }
+  const token = input.token;
+  const login = input.login.trim();
+  if (!login) {
+    return { ok: false, reason: SIGN_IN_TO_CLAIM_MESSAGE, stage: "not_signed_in" };
+  }
+  const validation = validateDomain(input.domainInput);
+  if (!validation.valid) {
+    return { ok: false, reason: validation.reason ?? "That domain cannot be claimed.", stage: "validation" };
+  }
+  const domain = validation.domain;
+  if (!input.acceptedTerms) {
+    return { ok: false, reason: REJECTION_REASONS.terms_not_accepted, stage: "terms" };
+  }
+
+  const now = input.now ?? Date.now();
+  let claim: DomainClaim;
+  try {
+    claim = createClaim(domain, login, now);
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err), stage: "validation" };
+  }
+
+  let repo: { repo: string; url: string; alreadyExisted: boolean };
+  try {
+    repo = await createSiteRepo({ token, owner: login, domain, fetchFn: input.fetchFn });
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+      stage: "create_repo",
+    };
+  }
+
+  let issue: { issueNumber: number; issueUrl: string; shardRepo: string };
+  try {
+    const registerIssue = buildRegisterIssue(domain, login, {
+      acceptedTerms: true,
+      requestedAt: now,
+    });
+    issue = await openRegisterIssue({ token, issue: registerIssue, fetchFn: input.fetchFn });
+  } catch (err) {
+    return {
+      ok: false,
+      reason:
+        `The site repo ${repo.repo} was created under @${login}, but the claim could not be filed: ` +
+        `${err instanceof Error ? err.message : String(err)} ` +
+        `Nothing is registered yet — retry the claim and the existing repo will be reused.`,
+      stage: "register_issue",
+    };
+  }
+
+  claim = submitClaim(claim, {
+    acceptedTerms: true,
+    issueNumber: issue.issueNumber,
+    issueUrl: issue.issueUrl,
+    now,
+  });
+  const registryEntry = await registryEntryForClaim(domain, login);
+
+  let seeded: { doc: SiteDocument; alreadySeeded: boolean };
+  try {
+    seeded = await seedSiteRepo({
+      token,
+      owner: login,
+      repo: repo.repo,
+      doc: buildStarterSiteDocument(domain),
+      fetchFn: input.fetchFn,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      reason:
+        `The site repo ${repo.repo} was created and the claim for "${domain}" was filed ` +
+        `(${issue.issueUrl}), but the starter site could not be written: ` +
+        `${err instanceof Error ? err.message : String(err)} ` +
+        `The claim is still pending with the register bot — retry the claim and the existing repo will be reused.`,
+      stage: "seed_site",
+    };
+  }
+
+  const opened: OpenedSite = {
+    domain,
+    repo: repo.repo,
+    repoUrl: repo.url,
+    doc: seeded.doc,
+    claim,
+    registryEntry,
+    issueUrl: issue.issueUrl,
+    alreadyExistedRepo: repo.alreadyExisted,
+    alreadySeeded: seeded.alreadySeeded,
+  };
+
+  let hookError: string | undefined;
+  if (input.onSiteOpened) {
+    try {
+      input.onSiteOpened(opened);
+    } catch (err) {
+      hookError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  return { ok: true, ...opened, ...(hookError ? { hookError } : {}) };
 }

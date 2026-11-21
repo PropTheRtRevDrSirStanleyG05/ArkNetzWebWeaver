@@ -6,7 +6,34 @@
 // refreshes on every change (debounced). State lives in EditorState
 // (editor.ts); this module is only DOM wiring.
 
-import { blockLabel, BLOCK_TYPES, defaultBlock, slashSuggestions } from "./blocks.js";
+import {
+  addTableColumn,
+  addTableRow,
+  appendListItem,
+  blockLabel,
+  BLOCK_TYPES,
+  clearListItemLink,
+  clearTableCellLink,
+  defaultBlock,
+  formatListItem,
+  formatTableCell,
+  indentListItem,
+  insertListItem,
+  makeTableRows,
+  outdentListItem,
+  parseSlashCommand,
+  parseTableSize,
+  removeListItem,
+  removeTableColumn,
+  removeTableRow,
+  setListItemLink,
+  setListItemText,
+  setTableCellLink,
+  setTableCellText,
+  slashSuggestions,
+  tableSize,
+  toggleTableHeader,
+} from "./blocks.js";
 import { EditorState } from "./editor.js";
 import { exportStaticZip } from "./export.js";
 import { attachMedia } from "./ia-media.js";
@@ -19,11 +46,18 @@ import { autosaveDraft, createMemoryRevisionStore, diffRevisions, loadDraft, mak
 import type { RevisionStore } from "./revisions.js";
 import { gateAppEmbed, gateMediaUpload, gatePublish, presetRole } from "./roles.js";
 import type { TeamRole } from "./types.js";
-import type { BlockNode, SiteDocument } from "./types.js";
+import type { BlockNode, ListItem, SiteDocument, TableCell } from "./types.js";
 import { renderBlock, renderSiteDocument } from "./renderer.js";
 import type { GithubFetchFn } from "./publish.js";
 import { importWxr } from "./wxr.js";
+import { importHtml, importHtmlFromUrl } from "./html-import.js";
+import type { HtmlFetchFn, HtmlImportResult } from "./html-import.js";
+import { describePeerCursors } from "./collab/cursors.js";
+import { describeConflict } from "./collab/types.js";
+import { buildSiteOpenedViewModel } from "./domains-ui.js";
+import type { OpenedSite } from "./domains.js";
 import { syncRunsFromText } from "./inline.js";
+import type { FormatPatch } from "./inline.js";
 import { blockRuns } from "./editor.js";
 
 export interface EditorUiOptions {
@@ -37,6 +71,9 @@ export interface EditorUiOptions {
   /** The per-domain site repo, when it exists. Null = not created yet. */
   getSiteRepo: (domain: string) => string | null;
   githubFetch: GithubFetchFn;
+  /** Fetch for the HTML importer's URL import (plain fetch, no auth).
+   *  Defaults to an adapter over githubFetch. */
+  htmlFetch?: HtmlFetchFn;
 }
 
 export interface EditorUiOptions {
@@ -132,6 +169,20 @@ export class EditorUI {
   /** Aspect ratio picked in the crop panel; the crop rectangle is
    *  computed against the real image dimensions at attach time. */
   private pendingAspect = "freeform";
+  /** The list item / table cell the shared list/table format bar
+   *  applies to: set when a cell/item editable gains focus. The block
+   *  object stays the same across canvas re-renders (EditorState
+   *  mutates it in place), but the editable element does not — after a
+   *  rebuild the user clicks back into a cell/item and the target is
+   *  set again; a stale editable simply yields "click a cell first". */
+  private listTableTarget:
+    | { block: BlockNode; kind: "item"; path: number[]; editable: HTMLElement }
+    | { block: BlockNode; kind: "cell"; row: number; col: number; editable: HTMLElement }
+    | null = null;
+  /** Re-render timer for the collab surface while joined (remote
+   *  polls arrive without a local edit, so the peer list / cursor
+   *  marks / conflict notes refresh on a tick, not on keystrokes). */
+  private collabTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly root: HTMLElement,
@@ -142,6 +193,12 @@ export class EditorUI {
     return this.editor?.doc ?? null;
   }
 
+  /** The underlying EditorState (collab session, peers, conflicts).
+   *  The document itself is available as `doc`. */
+  get editorState(): EditorState | null {
+    return this.editor;
+  }
+
   private $(id: string): HTMLElement {
     const el = this.root.ownerDocument.getElementById(id);
     if (!el) throw new Error(`editor element #${id} is missing`);
@@ -149,6 +206,14 @@ export class EditorUI {
   }
 
   open(doc: SiteDocument): void {
+    const old = this.editor;
+    if (old?.collabSession && old.doc.domain !== doc.domain) {
+      // Switching sites ends the old session: its timers and relay
+      // state belong to the old domain, and its blocks stay in the
+      // old document. Re-opening the SAME domain keeps the session.
+      this.stopCollabTimer();
+      void old.stopCollab();
+    }
     const clone: SiteDocument = JSON.parse(JSON.stringify(doc)) as SiteDocument;
     this.editor = new EditorState(clone);
     this.revisions = [];
@@ -161,6 +226,16 @@ export class EditorUI {
 
   close(): void {
     this.root.hidden = true;
+  }
+
+  /** Open a freshly claimed site: the starter (or kept) document for
+   *  the claimed domain, with the pending-claim state in the status
+   *  line — the claim is pending until register.yml closes the
+   *  REGISTER issue, so the UI never says the domain is registered. */
+  showSiteOpened(opened: OpenedSite): void {
+    const vm = buildSiteOpenedViewModel(opened);
+    this.open(opened.doc);
+    this.setStatus(`${vm.heading} — ${vm.message} ${vm.pendingNote} Claim issue: ${vm.issueUrl}`);
   }
 
   private wired = false;
@@ -224,6 +299,41 @@ export class EditorUI {
     (this.$("diff-btn") as HTMLButtonElement).onclick = () => this.renderDiff();
     (this.$("export-btn") as HTMLButtonElement).onclick = () => this.handleExport();
     (this.$("wxr-input") as HTMLInputElement).addEventListener("change", (e) => void this.handleWxr(e));
+    (this.$("html-import-input") as HTMLInputElement).addEventListener("change", (e) => void this.handleHtmlImportFile(e));
+    (this.$("html-import-url-btn") as HTMLButtonElement).onclick = () => void this.handleHtmlImportUrl();
+    this.buildCollabBar();
+  }
+
+  /** The collaboration strip in the editor bar: Join / Leave, a
+   *  status line and the peer list. Built once, like the rest of the
+   *  chrome; renderCollab() owns its contents afterwards. */
+  private buildCollabBar(): void {
+    const bar = this.$("edit-view-btn").parentNode as HTMLElement | null;
+    if (!bar) return;
+    const strip = document.createElement("div");
+    strip.className = "an-collab-bar";
+    strip.id = "collab-bar";
+    const joinBtn = document.createElement("button");
+    joinBtn.type = "button";
+    joinBtn.id = "collab-join-btn";
+    joinBtn.textContent = "Join collaboration";
+    joinBtn.title = "Edit this site live with others — needs GitHub sign-in";
+    joinBtn.onclick = () => void this.handleCollabJoin();
+    const leaveBtn = document.createElement("button");
+    leaveBtn.type = "button";
+    leaveBtn.id = "collab-leave-btn";
+    leaveBtn.textContent = "Leave collaboration";
+    leaveBtn.disabled = true;
+    leaveBtn.onclick = () => void this.handleCollabLeave();
+    const status = document.createElement("span");
+    status.id = "collab-status";
+    status.className = "an-note";
+    status.textContent = "Not collaborating.";
+    const peers = document.createElement("div");
+    peers.id = "collab-peers";
+    peers.className = "an-collab-peers";
+    strip.append(joinBtn, leaveBtn, status, peers);
+    bar.appendChild(strip);
   }
 
   private guardApp(type: BlockNode["type"], fn: () => void): void {
@@ -266,6 +376,9 @@ export class EditorUI {
     setDisabled("theme-select", !canEdit);
     setDisabled("revision-btn", !canEdit);
     setDisabled("wxr-input", !canEdit);
+    setDisabled("html-import-input", !canEdit);
+    setDisabled("html-import-url", !canEdit);
+    setDisabled("html-import-url-btn", !canEdit);
   }
 
   /** Apply the colour mode app-wide (B5): toggle the .an-dark root
@@ -295,6 +408,35 @@ export class EditorUI {
     const input = this.$("slash-input") as HTMLInputElement;
     const value = input.value.trim();
     if (!value) return;
+    const cmd = parseSlashCommand(value);
+    if (cmd && this.editor && (cmd.type === "list" || cmd.type === "table")) {
+      // EditorState.typeLine can only pass { type, text } through, so
+      // it cannot carry a list style or a table size — list/table slash
+      // commands are inserted here instead, with the style/size parsed
+      // from the text: "/ol Tasks" is a numbered list whose first item
+      // is "Tasks"; "/table 2x4" is a 2×4 table; "/table Sales" is a
+      // 3×3 table captioned "Sales".
+      if (cmd.type === "list") {
+        const keyword = value.slice(1).split(/\s/)[0]?.toLowerCase();
+        const block = this.editor.insertBlock("list", undefined, {
+          listStyle: keyword === "ol" ? "ol" : "ul",
+        });
+        if (cmd.text) block.listItems = [{ text: cmd.text }];
+      } else {
+        const size = parseTableSize(cmd.text);
+        const block = this.editor.insertBlock("table");
+        if (size) {
+          block.rows = makeTableRows(size.rows, size.cols, true);
+          block.headerRow = true;
+        } else if (cmd.text) {
+          block.caption = cmd.text;
+        }
+      }
+      input.value = "";
+      this.renderSlashSuggestions("");
+      this.afterChange();
+      return;
+    }
     this.editor?.typeLine(value);
     input.value = "";
     this.renderSlashSuggestions("");
@@ -348,9 +490,9 @@ export class EditorUI {
   }
 
   /** Format toolbar: bold/italic/underline/strikethrough/code/link on
-   *  the current selection inside a contenteditable text block. The
-   *  selection is read from the DOM, applied to the block's typed runs,
-   *  and the canvas re-renders through the shared renderer.
+   *  the current selection inside a contenteditable element. The
+   *  selection is read from the DOM, applied to the target's typed
+   *  runs, and the preview refreshes on every change.
    *
    *  Selection survival (B3): a mousedown on a toolbar button moves
    *  focus out of the contenteditable and collapses the selection
@@ -360,16 +502,38 @@ export class EditorUI {
    *  never leaves the editable, and the toolbar captures the selection
    *  on mousedown into a SavedSelection, so actions that must move
    *  focus — typing a URL in the link input, then clicking Link — still
-   *  apply to the text that was selected. */
-  private formatToolbar(block: BlockNode, editable: HTMLElement): HTMLElement {
+   *  apply to the text that was selected.
+   *
+   *  `resolveEditable` supplies the editable the bar applies to: a
+   *  fixed element for a text block, the focused cell/item for a list
+   *  or table block (null when nothing is focused yet — the bar then
+   *  says so instead of formatting the wrong text). `after` runs after
+   *  a successful format action: text blocks rebuild the canvas
+   *  (afterChange); list/table cells only refresh the preview, so the
+   *  focused editable survives (R1). */
+  private richTextBar(
+    resolveEditable: () => HTMLElement | null,
+    applyFormat: (start: number, end: number, patch: FormatPatch, mode: "set" | "toggle") => boolean,
+    applyLink: (start: number, end: number, href: string) => boolean,
+    clearLink: (start: number, end: number) => void,
+    after: () => void,
+    noTargetMessage?: string,
+  ): HTMLElement {
     const bar = document.createElement("div");
     bar.className = "an-fmt-bar";
     const saved = new SavedSelection();
     const canEdit = this.canEdit();
     // Capture before focus moves: mousedown fires before the default
     // focus change collapses the selection.
-    bar.addEventListener("mousedown", () => saved.capture(editable, window.getSelection()));
-    const sel = (): { start: number; end: number } | null => saved.take(editable, window.getSelection());
+    bar.addEventListener("mousedown", () => {
+      const editable = resolveEditable();
+      if (editable) saved.capture(editable, window.getSelection());
+    });
+    const sel = (): { start: number; end: number } | null => {
+      const editable = resolveEditable();
+      if (!editable) return null;
+      return saved.take(editable, window.getSelection());
+    };
     const keepFocus = (e: MouseEvent): void => e.preventDefault();
     const mkBtn = (text: string, title: string, fn: (r: { start: number; end: number }) => void) => {
       const b = document.createElement("button");
@@ -380,21 +544,25 @@ export class EditorUI {
       b.addEventListener("mousedown", keepFocus);
       b.onclick = (e) => {
         e.stopPropagation();
+        if (!resolveEditable()) {
+          this.setStatus(noTargetMessage ?? "Select some text first, then apply formatting.");
+          return;
+        }
         const r = sel();
         if (!r || r.start === r.end) {
           this.setStatus("Select some text first, then apply formatting.");
           return;
         }
         fn(r);
-        this.afterChange();
+        after();
       };
       bar.appendChild(b);
     };
-    mkBtn("B", "Bold", (r) => this.editor?.formatBlock(block.id ?? "", r.start, r.end, { bold: true }, "toggle"));
-    mkBtn("I", "Italic", (r) => this.editor?.formatBlock(block.id ?? "", r.start, r.end, { italic: true }, "toggle"));
-    mkBtn("U", "Underline", (r) => this.editor?.formatBlock(block.id ?? "", r.start, r.end, { underline: true }, "toggle"));
-    mkBtn("S", "Strikethrough", (r) => this.editor?.formatBlock(block.id ?? "", r.start, r.end, { strike: true }, "toggle"));
-    mkBtn("<>", "Inline code", (r) => this.editor?.formatBlock(block.id ?? "", r.start, r.end, { code: true }, "toggle"));
+    mkBtn("B", "Bold", (r) => applyFormat(r.start, r.end, { bold: true }, "toggle"));
+    mkBtn("I", "Italic", (r) => applyFormat(r.start, r.end, { italic: true }, "toggle"));
+    mkBtn("U", "Underline", (r) => applyFormat(r.start, r.end, { underline: true }, "toggle"));
+    mkBtn("S", "Strikethrough", (r) => applyFormat(r.start, r.end, { strike: true }, "toggle"));
+    mkBtn("<>", "Inline code", (r) => applyFormat(r.start, r.end, { code: true }, "toggle"));
     const linkInput = document.createElement("input");
     linkInput.className = "an-ed-field";
     linkInput.type = "text";
@@ -410,6 +578,10 @@ export class EditorUI {
     linkBtn.addEventListener("mousedown", keepFocus);
     linkBtn.onclick = (e) => {
       e.stopPropagation();
+      if (!resolveEditable()) {
+        this.setStatus(noTargetMessage ?? "Select some text first, then set a link.");
+        return;
+      }
       const r = sel();
       const href = linkInput.value.trim();
       if (!r || r.start === r.end) {
@@ -420,11 +592,11 @@ export class EditorUI {
         this.setStatus("Type a link target first (https://… or arknetz://…).");
         return;
       }
-      if (!this.editor?.setBlockLink(block.id ?? "", r.start, r.end, href)) {
+      if (!applyLink(r.start, r.end, href)) {
         this.setStatus(`Refused unsafe link target: ${href}. Links must be https: to archive.org / raw.githubusercontent.com, or arknetz://.`);
         return;
       }
-      this.afterChange();
+      after();
     };
     bar.appendChild(linkBtn);
     const unlinkBtn = document.createElement("button");
@@ -435,16 +607,94 @@ export class EditorUI {
     unlinkBtn.addEventListener("mousedown", keepFocus);
     unlinkBtn.onclick = (e) => {
       e.stopPropagation();
+      if (!resolveEditable()) {
+        this.setStatus(noTargetMessage ?? "Select the linked text first, then Unlink.");
+        return;
+      }
       const r = sel();
       if (!r || r.start === r.end) {
         this.setStatus("Select the linked text first, then Unlink.");
         return;
       }
-      this.editor?.clearBlockLink(block.id ?? "", r.start, r.end);
-      this.afterChange();
+      clearLink(r.start, r.end);
+      after();
     };
     bar.appendChild(unlinkBtn);
     return bar;
+  }
+
+  /** The format bar for one text block: formatting goes through
+   *  EditorState, and the canvas rebuilds after each action. */
+  private formatToolbar(block: BlockNode, editable: HTMLElement): HTMLElement {
+    return this.richTextBar(
+      () => editable,
+      (s, e, patch, mode) => this.editor?.formatBlock(block.id ?? "", s, e, patch, mode) ?? false,
+      (s, e, href) => this.editor?.setBlockLink(block.id ?? "", s, e, href) ?? false,
+      (s, e) => {
+        this.editor?.clearBlockLink(block.id ?? "", s, e);
+      },
+      () => this.afterChange(),
+    );
+  }
+
+  /** The format bar for one list/table block: one bar for the whole
+   *  block, applying to the focused item/cell (see listTableTarget).
+   *  Formatting goes through the list/table helpers in blocks.ts —
+   *  EditorState.formatBlock only knows text blocks — and the canvas
+   *  is NOT rebuilt, so the focused editable survives the action. */
+  private listTableFormatBar(block: BlockNode): HTMLElement {
+    const target = (): typeof this.listTableTarget =>
+      this.listTableTarget?.block === block ? this.listTableTarget : null;
+    return this.richTextBar(
+      () => target()?.editable ?? null,
+      (s, e, patch, mode) => {
+        const t = target();
+        if (!t) return false;
+        const ok =
+          t.kind === "item"
+            ? formatListItem(block, t.path, s, e, patch, mode)
+            : formatTableCell(block, t.row, t.col, s, e, patch, mode);
+        if (ok && this.editor) this.editor.dirty = true;
+        return ok;
+      },
+      (s, e, href) => {
+        const t = target();
+        if (!t) return false;
+        const ok =
+          t.kind === "item"
+            ? setListItemLink(block, t.path, s, e, href)
+            : setTableCellLink(block, t.row, t.col, s, e, href);
+        if (ok && this.editor) this.editor.dirty = true;
+        return ok;
+      },
+      (s, e) => {
+        const t = target();
+        if (!t) return;
+        if (t.kind === "item") clearListItemLink(block, t.path, s, e);
+        else clearTableCellLink(block, t.row, t.col, s, e);
+        if (this.editor) this.editor.dirty = true;
+      },
+      () => {
+        this.refreshPreview();
+        this.scheduleAutosave();
+      },
+      "Click a list item or table cell first, then select text to format.",
+    );
+  }
+
+  /** A small button for a block toolbar row (list/table structure
+   *  controls). The click never selects the block itself. */
+  private barButton(bar: HTMLElement, text: string, title: string, fn: () => void): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = text;
+    b.title = title;
+    b.onclick = (e) => {
+      e.stopPropagation();
+      fn();
+    };
+    bar.appendChild(b);
+    return b;
   }
 
   private handleExport(): void {
@@ -470,6 +720,286 @@ export class EditorUI {
     this.afterChange();
     this.setStatus(`WordPress import: ${imported} post(s)/page(s) imported, ${skipped} attachment(s)/draft(s) skipped. Scripts were wrapped into sandboxed app blocks, not executed.`);
     input.value = "";
+  }
+
+  /** Fetch for the HTML importer's URL import: the injected
+   *  htmlFetch when the shell provided one, else an adapter over the
+   *  GitHub fetch (same shape — status + text — no auth attached). */
+  private htmlFetch(): HtmlFetchFn {
+    if (this.opts.htmlFetch) return this.opts.htmlFetch;
+    return (url: string) => this.opts.githubFetch(url, { method: "GET", headers: {} });
+  }
+
+  /** Import an .html file into the current document. The importer
+   *  never throws on malformed input (it degrades to an empty
+   *  document with a note) — and a read failure is reported in the
+   *  status line, never thrown either. */
+  private async handleHtmlImportFile(e: Event): Promise<void> {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file || !this.editor) return;
+    let text: string;
+    try {
+      text = await file.text();
+    } catch (err) {
+      this.setStatus(`HTML import failed — could not read “${file.name}”: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const result = importHtml(text, { domain: this.editor.doc.domain });
+    this.applyHtmlImport(result);
+    input.value = "";
+  }
+
+  /** Import a page from a URL into the current document. A fetch
+   *  failure returns an empty document with a plain-language note
+   *  (importHtmlFromUrl never throws) — the status line says so. */
+  private async handleHtmlImportUrl(): Promise<void> {
+    const url = (this.$("html-import-url") as HTMLInputElement).value.trim();
+    if (!url) {
+      this.setStatus("Type a page URL first, then Import URL.");
+      return;
+    }
+    if (!this.editor) return;
+    this.setStatus(`Fetching ${url}…`);
+    const result = await importHtmlFromUrl(url, {
+      domain: this.editor.doc.domain,
+      fetchFn: this.htmlFetch(),
+    });
+    this.applyHtmlImport(result);
+  }
+
+  /** Append an import result to the current document. Blocks go in
+   *  through insertBlock (not a direct splice) so a live collab
+   *  session broadcasts them to peers like any other local edit. An
+   *  empty document also adopts the imported title and nav; a
+   *  document with content keeps its own. Counts are shown plainly,
+   *  with the importer's notes when it dropped anything. */
+  private applyHtmlImport(result: HtmlImportResult): void {
+    if (!this.editor) return;
+    if (this.editor.blocks.length === 0) {
+      if (result.doc.title) this.editor.doc.title = result.doc.title;
+      if ((this.editor.doc.nav ?? []).length === 0 && (result.doc.nav ?? []).length > 0) {
+        this.editor.doc.nav = result.doc.nav;
+      }
+    }
+    for (const block of result.doc.blocks) {
+      this.editor.insertBlock(block.type, this.editor.blocks.length, { ...block });
+    }
+    this.afterChange();
+    const notes = result.notes.length > 0 ? ` ${result.notes.join(" ")}` : "";
+    this.setStatus(`HTML import: ${result.imported} block(s) imported, ${result.skipped} skipped.${notes}`);
+  }
+
+  // --- Real-time collaboration UI -------------------------------------
+
+  /** Join the collab session for this site. The engine refuses
+   *  loudly without a token (or when the relay is unreachable) —
+   *  that message is surfaced in the status line, never swallowed
+   *  and never replaced with a fake "collaborating" state. */
+  private async handleCollabJoin(): Promise<void> {
+    if (!this.editor) return;
+    const token = this.opts.getGithubToken();
+    const login = this.opts.getGithubLogin();
+    try {
+      await this.editor.startCollab({
+        token,
+        owner: login ?? "",
+        login: login ?? "",
+        fetchFn: this.opts.githubFetch,
+        autoPoll: true,
+      });
+    } catch (err) {
+      // The engine refuses loudly without a token (or when the relay
+      // is unreachable) — surface that message in BOTH status lines,
+      // never swallow it and never show a fake "collaborating" state.
+      const message = err instanceof Error ? err.message : String(err);
+      this.setStatus(message);
+      this.setCollabStatus(message);
+      return;
+    }
+    this.startCollabTimer();
+    this.renderCollab();
+  }
+
+  /** Leave the collab session: timers stop, my relay state file is
+   *  deleted, and the branch goes away when I was the last peer. My
+   *  blocks stay in the document either way. */
+  private async handleCollabLeave(): Promise<void> {
+    if (!this.editor?.collabSession) {
+      this.setStatus("Not collaborating — nothing to leave.");
+      return;
+    }
+    this.stopCollabTimer();
+    try {
+      const result = await this.editor.stopCollab();
+      this.renderCollab();
+      this.setStatus(
+        result.branchDeleted
+          ? "Left collaboration — you were the last peer, so the collab branch was deleted. Your blocks stay in the document."
+          : "Left collaboration. Your blocks stay in the document.",
+      );
+    } catch (err) {
+      this.renderCollab();
+      this.setStatus(`Leave failed: ${err instanceof Error ? err.message : String(err)} — the session may still be active; try leaving again.`);
+    }
+  }
+
+  /** Write the collab strip's own status line (next to Join/Leave),
+   *  when the strip exists. */
+  private setCollabStatus(text: string): void {
+    const status = this.root.ownerDocument.getElementById("collab-status");
+    if (status) status.textContent = text;
+  }
+
+  private startCollabTimer(): void {
+    this.stopCollabTimer();
+    const w = window as unknown as {
+      setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
+    };
+    if (typeof w.setInterval === "function") {
+      this.collabTimer = w.setInterval(() => this.renderCollab(), 2000);
+    }
+  }
+
+  private stopCollabTimer(): void {
+    if (this.collabTimer !== null) {
+      const w = window as unknown as { clearInterval?: (id: ReturnType<typeof setInterval>) => void };
+      w.clearInterval?.(this.collabTimer);
+      this.collabTimer = null;
+    }
+  }
+
+  /** Public refresh for the collab surface (tests drive it by hand;
+   *  the app uses the timer + afterChange). */
+  refreshCollab(): void {
+    this.renderCollab();
+  }
+
+  /** The canvas block wrap for a block id, or null (nested column
+   *  children included — the walk covers the whole canvas tree). */
+  private findBlockWrap(blockId: string): HTMLElement | null {
+    const canvas = this.$("editor-canvas");
+    let found: HTMLElement | null = null;
+    const walk = (el: Element): void => {
+      if (found) return;
+      const h = el as HTMLElement;
+      if (h.classList?.contains("an-ed-block") && h.dataset?.id === blockId) {
+        found = h;
+        return;
+      }
+      for (const child of el.children) walk(child);
+    };
+    walk(canvas);
+    return found;
+  }
+
+  /** Re-render the collaboration surface from the EditorState: peer
+   *  list, peer cursor marks on the canvas, conflict notes on the
+   *  losing block, stale flags. Safe to call when not joined (it
+   *  clears everything). Called after every render and on a timer
+   *  while joined, because remote polls arrive without a local edit. */
+  private renderCollab(): void {
+    const doc = this.root.ownerDocument;
+    const state = this.editor;
+    const joined = !!state?.collabSession;
+    const selfLogin = this.opts.getGithubLogin() ?? "";
+    const joinBtn = doc.getElementById("collab-join-btn") as HTMLButtonElement | null;
+    const leaveBtn = doc.getElementById("collab-leave-btn") as HTMLButtonElement | null;
+    const status = doc.getElementById("collab-status");
+    const peersEl = doc.getElementById("collab-peers");
+    if (joinBtn) joinBtn.disabled = joined || !this.canEdit();
+    if (leaveBtn) leaveBtn.disabled = !joined;
+    if (peersEl) peersEl.innerHTML = "";
+    // Clear the old canvas marks first: the canvas is rebuilt on
+    // every edit, and a re-render must never stack duplicate marks.
+    const canvas = doc.getElementById("editor-canvas");
+    if (canvas) {
+      const stale: Element[] = [];
+      const walk = (el: Element): void => {
+        const h = el as HTMLElement;
+        if (
+          h.classList?.contains("an-collab-cursor") ||
+          h.classList?.contains("an-collab-conflict") ||
+          h.classList?.contains("an-collab-stale")
+        ) {
+          stale.push(el);
+        }
+        for (const child of el.children) walk(child);
+      };
+      walk(canvas);
+      for (const el of stale) (el as HTMLElement).remove();
+    }
+    if (!state) {
+      if (status) status.textContent = "Not collaborating.";
+      return;
+    }
+    if (!joined) {
+      if (status) {
+        status.textContent = state.collabError
+          ? `Collaboration error: ${state.collabError}`
+          : "Not collaborating.";
+      }
+      return;
+    }
+    const peers = state.collabPeers;
+    const others = peers.filter((p) => p.login !== selfLogin);
+    if (status) {
+      status.textContent = state.collabOffline
+        ? `Collaborating as ${selfLogin} — offline, retrying. ${others.length} other peer${others.length === 1 ? "" : "s"} here.`
+        : `Collaborating as ${selfLogin} on ${state.doc.domain} — ${others.length} other peer${others.length === 1 ? "" : "s"} here. Edits sync about every 5 seconds.`;
+    }
+    if (peersEl) {
+      for (const peer of peers) {
+        const row = document.createElement("div");
+        row.className = "an-collab-peer";
+        row.textContent = `${peer.login}${peer.login === selfLogin ? " (you)" : ""}${peer.stale ? " (away)" : ""}`;
+        (row as HTMLElement).style.color = peer.colour;
+        peersEl.appendChild(row);
+      }
+    }
+    if (!canvas) return;
+    for (const mark of describePeerCursors(peers, selfLogin)) {
+      if (!mark.blockId) continue;
+      const wrap = this.findBlockWrap(mark.blockId);
+      if (!wrap) continue;
+      const el = document.createElement("div");
+      el.className = "an-collab-cursor";
+      el.textContent = mark.label + (mark.stale ? " (away)" : "");
+      el.style.color = mark.colour;
+      el.style.borderColor = mark.colour;
+      if (mark.stale) el.dataset.stale = "true";
+      wrap.appendChild(el);
+    }
+    for (const note of state.collabConflicts) {
+      const wrap = this.findBlockWrap(note.blockId);
+      if (!wrap) continue;
+      const el = document.createElement("div");
+      el.className = "an-collab-conflict";
+      el.textContent = describeConflict(note);
+      wrap.appendChild(el);
+    }
+    for (const blockId of state.staleBlockIds()) {
+      const wrap = this.findBlockWrap(blockId);
+      if (!wrap) continue;
+      const el = document.createElement("div");
+      el.className = "an-collab-stale";
+      el.textContent = "The last writer of this block is away (no heartbeat for 30 s) — the block stays as it is.";
+      wrap.appendChild(el);
+    }
+  }
+
+  /** Share my caret with the collab session (focus only — a write
+   *  per keystroke would spam the relay, and typing already
+   *  broadcasts through the session's own diff). No-op when not
+   *  joined. */
+  private shareCursor(block: BlockNode, editable: HTMLElement): void {
+    if (!this.editor?.collabSession) return;
+    const sel = selectionOffsetsIn(editable, window.getSelection());
+    this.editor.setLocalCursor(
+      sel
+        ? { blockId: block.id ?? null, start: sel.start, end: sel.end }
+        : { blockId: block.id ?? null, start: 0, end: 0 },
+    );
   }
 
   private renderDiff(): void {
@@ -514,6 +1044,7 @@ export class EditorUI {
     this.renderSidebar();
     this.refreshPreview();
     this.scheduleAutosave();
+    this.renderCollab();
   }
 
   private refreshPreview(): void {
@@ -557,6 +1088,7 @@ export class EditorUI {
     this.renderSidebar();
     this.refreshPreview();
     this.applyRoleGating();
+    this.renderCollab();
   }
 
   private renderCanvas(): void {
@@ -676,6 +1208,7 @@ export class EditorUI {
       // Viewers read: contenteditable is off for roles that cannot edit (B4).
       el.contentEditable = this.canEdit() ? "true" : "false";
       el.textContent = block.text ?? "";
+      el.addEventListener("focus", () => this.shareCursor(block, el));
       el.addEventListener("input", () => {
         this.updateBlockText(block, el.textContent ?? "");
       });
@@ -804,6 +1337,80 @@ export class EditorUI {
         body.append(note, area);
         return body;
       }
+      case "list": {
+        const bar = document.createElement("div");
+        bar.className = "an-ed-bar";
+        const styleLabel = document.createElement("span");
+        styleLabel.className = "an-ed-label";
+        styleLabel.textContent = "List";
+        bar.appendChild(styleLabel);
+        const ulBtn = this.barButton(bar, "• Bulleted", "Bulleted list", () => {
+          this.patchBlock(block, { listStyle: "ul" });
+          this.afterChange();
+        });
+        const olBtn = this.barButton(bar, "1. Numbered", "Numbered list", () => {
+          this.patchBlock(block, { listStyle: "ol" });
+          this.afterChange();
+        });
+        ulBtn.setAttribute("aria-pressed", String((block.listStyle ?? "ul") === "ul"));
+        olBtn.setAttribute("aria-pressed", String(block.listStyle === "ol"));
+        this.barButton(bar, "+ Item", "Add an item at the end of the list", () => {
+          if (appendListItem(block)) this.afterChange();
+          else this.setStatus("List is full.");
+        });
+        body.appendChild(bar);
+        body.appendChild(this.listTableFormatBar(block));
+        for (const [i, item] of (block.listItems ?? []).entries()) {
+          body.appendChild(this.renderListItemRow(block, item, [i]));
+        }
+        return body;
+      }
+      case "table": {
+        const bar = document.createElement("div");
+        bar.className = "an-ed-bar";
+        const label = document.createElement("span");
+        label.className = "an-ed-label";
+        const size = tableSize(block);
+        label.textContent = size ? `Table — ${size.rows}×${size.cols}` : "Table";
+        bar.appendChild(label);
+        this.barButton(bar, "+ Row", "Add a row at the bottom", () => {
+          if (addTableRow(block)) this.afterChange();
+          else this.setStatus("Table is at the maximum number of rows.");
+        });
+        this.barButton(bar, "− Row", "Remove the last row", () => {
+          if (removeTableRow(block)) this.afterChange();
+          else this.setStatus("A table keeps at least one row.");
+        });
+        this.barButton(bar, "+ Column", "Add a column at the right", () => {
+          if (addTableColumn(block)) this.afterChange();
+          else this.setStatus("Table is at the maximum number of columns.");
+        });
+        this.barButton(bar, "− Column", "Remove the last column", () => {
+          if (removeTableColumn(block)) this.afterChange();
+          else this.setStatus("A table keeps at least one column.");
+        });
+        const headerBtn = this.barButton(bar, "Header row", "Toggle the header row", () => {
+          toggleTableHeader(block);
+          this.afterChange();
+        });
+        headerBtn.setAttribute("aria-pressed", String(block.headerRow !== false));
+        body.appendChild(bar);
+        body.appendChild(this.listTableFormatBar(block));
+        body.appendChild(
+          this.fieldInput("Caption (shown above the table)", block.caption ?? "", (v) =>
+            this.patchBlock(block, { caption: v }),
+          ),
+        );
+        for (const [r, row] of (block.rows ?? []).entries()) {
+          const rowEl = document.createElement("div");
+          rowEl.className = "an-ed-table-row";
+          for (const [c, cell] of row.entries()) {
+            rowEl.appendChild(this.renderTableCell(block, cell, r, c));
+          }
+          body.appendChild(rowEl);
+        }
+        return body;
+      }
       case "cols": {
         for (const col of block.columns ?? []) {
           const colEl = document.createElement("div");
@@ -854,6 +1461,80 @@ export class EditorUI {
         return body;
       }
     }
+  }
+
+  /** One editable list-item row: a contenteditable for the item text,
+   *  indent/outdent/add/remove controls, and its nested children.
+   *  Focusing the editable makes the item the shared format bar's
+   *  target; typing updates the item's runs in place (no canvas
+   *  rebuild, so focus survives — R1). */
+  private renderListItemRow(block: BlockNode, item: ListItem, path: number[]): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "an-ed-list-item";
+    const editable = document.createElement("div");
+    editable.className = "an-ed-text";
+    editable.contentEditable = this.canEdit() ? "true" : "false";
+    editable.textContent = item.text ?? "";
+    editable.addEventListener("focus", () => {
+      this.listTableTarget = { block, kind: "item", path: [...path], editable };
+      this.shareCursor(block, editable);
+    });
+    editable.addEventListener("input", () => {
+      setListItemText(block, path, editable.textContent ?? "");
+      if (this.editor) this.editor.dirty = true;
+      this.refreshPreview();
+      this.scheduleAutosave();
+    });
+    const controls = document.createElement("div");
+    controls.className = "an-ed-bar";
+    this.barButton(controls, "→", "Indent — make this item a child of the item above", () => {
+      if (indentListItem(block, path)) this.afterChange();
+      else this.setStatus("Cannot indent the first item of a level.");
+    });
+    this.barButton(controls, "←", "Outdent — move this item up one level", () => {
+      if (outdentListItem(block, path)) this.afterChange();
+      else this.setStatus("Top-level items cannot be outdented.");
+    });
+    this.barButton(controls, "+", "Add an item after this one", () => {
+      if (insertListItem(block, path)) this.afterChange();
+    });
+    this.barButton(controls, "✕", "Remove this item", () => {
+      if (removeListItem(block, path)) this.afterChange();
+      else this.setStatus("A list keeps at least one item.");
+    });
+    row.append(editable, controls);
+    if (item.children && item.children.length > 0) {
+      const kids = document.createElement("div");
+      kids.className = "an-ed-list-children";
+      for (const [i, child] of item.children.entries()) {
+        kids.appendChild(this.renderListItemRow(block, child, [...path, i]));
+      }
+      row.appendChild(kids);
+    }
+    return row;
+  }
+
+  /** One editable table cell. Focusing it makes the cell the shared
+   *  format bar's target; typing updates the cell's runs in place. */
+  private renderTableCell(block: BlockNode, cell: TableCell, row: number, col: number): HTMLElement {
+    const wrap = document.createElement("div");
+    wrap.className = "an-ed-table-cell";
+    const editable = document.createElement("div");
+    editable.className = "an-ed-text";
+    editable.contentEditable = this.canEdit() ? "true" : "false";
+    editable.textContent = cell.text ?? "";
+    editable.addEventListener("focus", () => {
+      this.listTableTarget = { block, kind: "cell", row, col, editable };
+      this.shareCursor(block, editable);
+    });
+    editable.addEventListener("input", () => {
+      setTableCellText(block, row, col, editable.textContent ?? "");
+      if (this.editor) this.editor.dirty = true;
+      this.refreshPreview();
+      this.scheduleAutosave();
+    });
+    wrap.appendChild(editable);
+    return wrap;
   }
 
   private fieldInput(label: string, value: string, onInput: (v: string) => void): HTMLElement {

@@ -29,9 +29,15 @@ const URL_HOSTS = new Set([
 ]);
 
 /** URL safety, shared by the renderer and the link formatter: only
- *  https: to the allow-listed hosts, or arknetz: deep links. Anything
- *  else (javascript:, http:, trackers) is rejected. */
+ *  https: to the allow-listed hosts, arknetz: deep links, or a
+ *  data:image/png|jpeg|gif|webp;base64 URL (the HTML importer's
+ *  image allow-list — embedded bytes, never a remote fetch). SVG
+ *  data: URLs stay refused: an SVG document can carry script. The
+ *  data: form is strict — exactly `data:image/<type>;base64,<b64>`
+ *  with no parameters, whitespace, or extra content — so a crafted
+ *  URL cannot smuggle a different media type or a script past it. */
 export function isSafeUrl(url: string): boolean {
+  if (/^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(url)) return true;
   try {
     const u = new URL(url);
     if (u.protocol === "arknetz:") return true;

@@ -10,7 +10,7 @@
 // links. Unknown block types render as a visible placeholder, never as
 // raw content and never silently dropped.
 
-import type { BlockNode, SiteDocument } from "./types.js";
+import type { BlockNode, ListItem, SiteDocument, TableCell } from "./types.js";
 import { escapeHtml, isSafeUrl, renderInlineRuns } from "./inline.js";
 import { plainText } from "./inline.js";
 import { injectAppBridgeShim } from "./viewer/app-bridge.js";
@@ -155,8 +155,47 @@ export function renderBlock(block: BlockNode, options?: RenderOptions): string {
   return cls ? `<div class="${cls}">${html}</div>` : html;
 }
 
+/** Render a list item's text: inline runs when it carries formatting,
+ *  plain escaped text otherwise. Children nest as the same list kind
+ *  inside the <li>, so a nested list stays one semantic list. */
+function renderListItem(item: ListItem, tag: "ul" | "ol"): string {
+  const inner = item.runs && item.runs.length > 0 ? renderInlineRuns(item.runs) : escapeHtml(item.text ?? "");
+  const kids =
+    item.children && item.children.length > 0
+      ? `<${tag}>${item.children.map((c) => renderListItem(c, tag)).join("")}</${tag}>`
+      : "";
+  return `<li>${inner}${kids}</li>`;
+}
+
+/** Render a table cell: inline runs when it carries formatting, plain
+ *  escaped text otherwise. */
+function renderTableCell(cell: TableCell): string {
+  return cell.runs && cell.runs.length > 0 ? renderInlineRuns(cell.runs) : escapeHtml(cell.text ?? "");
+}
+
 function renderBlockInner(block: BlockNode, options?: RenderOptions): string {
   switch (block.type) {
+    case "list": {
+      // A malformed list (no listItems array — e.g. hand-written JSON)
+      // renders as a visible placeholder, never as raw content.
+      if (!Array.isArray(block.listItems)) return `<p class="an-unknown">[invalid list block]</p>`;
+      const tag = block.listStyle === "ol" ? "ol" : "ul";
+      return `<${tag} class="an-list">${block.listItems.map((i) => renderListItem(i, tag)).join("")}</${tag}>`;
+    }
+    case "table": {
+      // Same guard as lists: malformed rows render as a placeholder.
+      if (!Array.isArray(block.rows) || block.rows.length === 0 || !block.rows.every((r) => Array.isArray(r))) {
+        return `<p class="an-unknown">[invalid table block]</p>`;
+      }
+      const header = block.headerRow !== false;
+      const caption = block.caption ? `<caption>${escapeHtml(block.caption)}</caption>` : "";
+      const head = header
+        ? `<thead><tr>${(block.rows[0] as TableCell[]).map((c) => `<th scope="col">${renderTableCell(c)}</th>`).join("")}</tr></thead>`
+        : "";
+      const bodyRows = header ? block.rows.slice(1) : block.rows;
+      const body = `<tbody>${bodyRows.map((row) => `<tr>${row.map((c) => `<td>${renderTableCell(c)}</td>`).join("")}</tr>`).join("")}</tbody>`;
+      return `<div class="an-table-wrap"><table class="an-table">${caption}${head}${body}</table></div>`;
+    }
     case "h1":
       return `<h1>${renderText(block)}</h1>`;
     case "h2":
@@ -297,6 +336,13 @@ blockquote{border-left:3px solid var(--an-accent);margin:1rem 0;padding-left:1re
 pre{background:#f3f4f6;padding:1rem;border-radius:8px;overflow:auto;max-width:100%;box-sizing:border-box}
 .an-site pre code{white-space:pre}
 .an-site{min-width:0;overflow-wrap:break-word}
+.an-list{overflow-wrap:break-word}
+.an-list li{overflow-wrap:break-word}
+.an-table-wrap{overflow-x:auto;max-width:100%}
+.an-table{border-collapse:collapse;width:100%}
+.an-table caption{text-align:left;font-weight:600;padding:.25rem 0}
+.an-table th,.an-table td{border:1px solid #e5e7eb;padding:.5rem;text-align:left;overflow-wrap:break-word;vertical-align:top}
+.an-table th{background:#f3f4f6}
 `;
 
 export function renderSiteDocument(site: SiteDocument, options?: RenderOptions): string {

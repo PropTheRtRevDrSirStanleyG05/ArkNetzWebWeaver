@@ -109,6 +109,12 @@ button:disabled{opacity:.45;cursor:default}
 .an-diff-removed{color:#b91c1c;background:#fef2f2;text-decoration:line-through}
 .an-diff-changed{color:#92400e;background:#fffbeb}
 .an-diff-same{color:#6b7280}
+/* Canvas table layout (round 2): table cells in the editor canvas
+   laid out as a grid, not stacked vertically. Editor-only classes —
+   the reader/preview rendering (.an-table) is untouched. */
+.an-ed-table-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.35rem}
+.an-ed-table-cell{min-width:0}
+.an-ed-table-cell .an-ed-text{width:100%}
 @media (max-width:900px){.an-editor-layout{grid-template-columns:1fr}}
 
 /* Phase panels — button style only; nav/host layout lives in the
