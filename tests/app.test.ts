@@ -188,8 +188,37 @@ test("shell: panels are a full-width strip above the reader, status below the to
   // stays on one line (ellipsised only if it cannot fit at all).
   assert.match(css, /#guest-badge\{[^}]*white-space:nowrap/);
   // B7: the toolbar wraps and the page cannot scroll horizontally.
+  // overflow-x:clip (not hidden) on html/body: hidden computes
+  // overflow-y to auto, which makes body a scroll container and breaks
+  // the sticky topbar (hunt 3) — clip prevents sideways scrolling
+  // without creating a scroll container, so sticky keeps working.
   assert.match(css, /\.an-toolbar\{[^}]*flex-wrap:wrap/);
-  assert.match(css, /overflow-x:hidden/);
+  assert.match(css, /overflow-x:clip/);
+  assert.doesNotMatch(css, /overflow-x:hidden/);
+});
+
+// Hunt 3 (2026-11-21): on load the app scrolled the reader into view
+// (main.ts showReader) while the topbar was position:static, so the
+// brand, account pill and Sign in button sat 166px above the viewport
+// and a first-time user could not see them until scrolling up. The
+// topbar is sticky now. The footer also carried two version strings
+// (core shell 0.1.0 + visual builder 0.3.0) while package.json said
+// 0.3.0 and tauri.conf.json/Cargo.toml said 0.1.0; the app is 0.4.0
+// everywhere now (minor bump for the feature-round-2 additions since
+// 0.3.0: collab, tables/lists, HTML importer).
+test("hunt3: topbar is sticky and the app reports one version, 0.4.0", () => {
+  const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+  assert.match(css, /\.an-topbar\{[^}]*position:sticky;top:0/);
+  assert.match(html, /ArkNetzWebWeaver 0\.4\.0/);
+  assert.doesNotMatch(html, /core shell 0\.1\.0 \+ visual builder/);
+  assert.doesNotMatch(html, /until the central repos exist/);
+  const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string };
+  assert.equal(pkg.version, "0.4.0");
+  const tauriConf = JSON.parse(readFileSync(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8")) as { version: string };
+  assert.equal(tauriConf.version, "0.4.0");
+  const cargo = readFileSync(new URL("../../src-tauri/Cargo.toml", import.meta.url), "utf8");
+  assert.match(cargo, /^version = "0\.4\.0"$/m);
 });
 
 // Fix pass 2 (visual defects, hunt 2): the CSS pins for H1/L7/L8/L9/L10.

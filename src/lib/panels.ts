@@ -176,7 +176,7 @@ export async function renderPanelHtml(
            <label>Body <textarea id="an-mail-body" rows="4"></textarea></label>
            <button id="an-mail-draft-btn" type="button">Save draft</button>
            <div id="an-mail-draft-status" role="status"></div>
-           <p class="an-note">Sending needs the recipient's public key from the contacts directory and a signed-in GitHub account — the directory is empty until the central repos exist, so sending stays disabled until then. Drafts are real and saved locally now.</p>`,
+           <p class="an-note">Sending needs the recipient's public key from the contacts directory and a signed-in GitHub account — the contacts directory has no entries yet, so sending stays disabled until then. Drafts are real and saved locally now.</p>`,
         )
       );
     }

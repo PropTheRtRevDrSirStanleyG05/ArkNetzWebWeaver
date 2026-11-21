@@ -33,7 +33,7 @@ export const DEMO_SITE: SiteDocument = {
     },
     {
       type: "quote",
-      text: "This is a demo site bundled with the shell. Real sites resolve through the sharded registry once the central repos exist.",
+      text: "This is a demo site bundled with the shell. Real sites resolve through the sharded registry — no sites have been published yet.",
     },
     {
       type: "code",

@@ -4,7 +4,7 @@
     "@noble/hashes": "^2.4.0",
     "@tauri-apps/api": "^2.0.0"
   },
-  "description": "ArkNetzWebWeaver by STANBEYOND — zero-server, $0/month decentralized web. Core shell 0.1.0 + visual builder 0.2.0: live-canvas Gutenberg-style editor sharing the reader's renderer, themes, revisions, roles, WXR import, static .zip export.",
+  "description": "ArkNetzWebWeaver by STANBEYOND \u2014 zero-server, $0/month decentralized web. Core shell + visual builder 0.4.0: live-canvas Gutenberg-style editor sharing the reader's renderer, themes, revisions, roles, WXR import, static .zip export, real-time collaboration, tables/lists, HTML import.",
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^24.19.2",
@@ -23,5 +23,5 @@
     "test": "npm run build && node --test dist/tests/*.test.js"
   },
   "type": "module",
-  "version": "0.3.0"
+  "version": "0.4.0"
 }

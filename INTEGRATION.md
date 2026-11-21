@@ -1935,3 +1935,116 @@ errors. Screenshots: `~/workspace/arknetzwebweaver/qa-screenshots/hunt2/`
   (no Action run has happened anywhere yet), deep-link end-to-end
   launch, AppImage launch (no /dev/fuse in VM), Windows.exe on
   real Windows, Android.apk signing + install.
+
+## Bug hunt 3 (second hunt on the live product), 2026-11-21
+
+Method: cloned the live client repo (head f567d9a4) and diffed it against
+the scaffold — zero drift (only local-only files differ: dict-training
+corpus/bin, src-tauri/gen). `npm run build` clean, dist/ served on
+localhost:8123, driven by puppeteer-core + Chrome 156 headless, desktop
+1280x900 and mobile 390x844; 20+ screenshots read as images. Tests
+627 -> 629 pass, 0 fail. Note: the cloned code failed an execution-risk
+check, so the test/build numbers below are from the scaffold (as in
+hunt 1), not from inside the clone.
+
+### Verified live (again)
+- All 7 workflow files parse as YAML and are byte-identical to the
+  scaffold copies: register.yml (FIXED 255-line version) in registry
+  shards 00/07/0f AND arknetz-actions; cleanup.yml, stats.yml,
+  mirror.yml. register.yml name: "Register domain".
+- Uploaded binaries from GitHub are sha256-identical to local seeds
+  and decompress with the v2 dictionary to valid JSON (registry/
+  contacts `{}`, moderation `{version:"0.1.0", patches:[]}`); dict
+  v2 sha256 a1786956… matches the seed.
+- Website status.json: 43 existing, 0 pending. OAuth chain by
+  execution: Sign in opens
+  `github.com/login/oauth/authorize?client_id=Ov23lic8terv0XOd3GDe&redirect_uri=arknetz%3A%2F%2Foauth%2Fcallback&scope=read%3Auser+public_repo`.
+  Claim dry-run stops exactly at "Sign in with GitHub first to claim
+  a domain" with zero GitHub calls. Publish as guest refuses exactly.
+  HTML import: 4 blocks from a fixture, imported <strong> renders bold
+  in the canvas. Table insert renders a full grid in the canvas
+  (Header 1-3, +Row/-Row/+Column/-Column); list insert works.
+  Dark mode toggles app-wide (body rgb(17,24,39)). No real 404s in
+  the console (the one 404 was the deliberate bad-URL import test).
+- Hunt-1 regressions all hold: Account Switcher Pill is a real top-bar
+  pill with a working menu ("No accounts signed in… + Add Another
+  Account"); panel nav scrolls the panel into view; URL-import
+  failures surface in the status line; domains terms checkbox is
+  inline with its label; slash row fits at 390px (rowScrollW ==
+  rowClientW == 358, + Block visible); no horizontal scroll at 390px;
+  claim watcher polls while pending. Bold (M2) re-verified with real
+  mouse events: `<strong>MOUSEBOLDTEST</strong>` in the live canvas
+  AND the preview (an earlier execCommand-based probe was a false
+  alarm — it targeted the Hero title, not a text block, and read a
+  stale detached node).
+
+### Bugs found and fixed
+- **Topbar scrolled off-screen at load (MEDIUM-HIGH):** on load the
+  app scrolls the reader into view (main.ts showReader), while the
+  topbar was `position: static` — scrollY 166 at load, brand /
+  account pill / Sign in button invisible until the user scrolled
+  up. Fix: `.an-topbar` is now `position: sticky; top: 0;
+  z-index: 50`. First attempt (sticky alone) did NOT work: `body`
+  and `html` carried `overflow-x: hidden`, which computes
+  `overflow-y` to `auto`, making body a scroll container that
+  breaks sticky in Chrome (proven via getComputedStyle: sticky
+  applied, header still at top -166). Fix: `overflow-x: clip`
+  on html/body instead — clip prevents sideways scrolling without
+  creating a scroll container, so sticky works. The B7 test now
+  asserts `overflow-x: clip` and forbids `hidden`. Verified:
+  headerTop 0 at load and after scrolling, desktop and 390px;
+  mobile docScrollW still 390 (no horizontal overflow).
+- **Collab-join refusal overwritten by autosave (MEDIUM):** as a
+  guest, Join showed "Collab needs your own GitHub token…" at
+  500 ms, but a pending autosave replaced it with "Autosaved
+  locally…" at 1000 ms — a ~500 ms window to read why Join did
+  nothing. Root cause: handleCollabJoin's catch set the status
+  without the M4 `statusHoldUntil` that the HTML-import failure
+  path uses. Fix: the catch now arms the 10 s hold before
+  setStatus. Verified: refusal persists through a full 10 s trace
+  after a dirty edit. Test added (integration-round2): refused
+  join + driven autosaveNow keeps the refusal.
+- **Manifest `pendingRepos` stale (MEDIUM, data):** the
+  protocol-root manifest still listed arknetz-actions,
+  arknetz-mirrors, arknetz-website as pending — all three have
+  existed since 2026-11-21 12:15. Fixed in the seed manifest and
+  in BUILD-SEED.mjs (which hardcodes the list and would have
+  reintroduced it on the next rebuild), plus the seed README
+  paragraph; re-pushed to arknetz-protocol-root.
+- **Stale "central repos don't exist" copy (LOW, five places):**
+  footer ("until the central repos exist"), reader demo note
+  ("the registry does not exist yet"), demo-site quote in
+  sample.ts, mail panel note ("directory is empty until the
+  central repos exist"), editor sidebar gate note ("the GitHub
+  Action … follows with the central repos"). All reworded to the
+  true state (registry live, no sites/contacts published yet; no
+  validating Action exists yet). The identical sentence inside
+  `ZSTD_DICTIONARY_CONTENT_SOURCE` (zstd.ts) was deliberately
+  LEFT alone: it is dictionary training data, clearly labelled
+  invented sample data, and changing it would desync the corpus
+  from the shipped dictionary bytes.
+
+### Version alignment (release prerequisite)
+- package.json said 0.3.0, tauri.conf.json and Cargo.toml said
+  0.1.0, the footer said "core shell 0.1.0 + visual builder
+  0.3.0" — and the AppImage was named _0.1.0. The app reports
+  its version nowhere else (no About/version UI). Aligned
+  everything to **0.4.0**: minor bump for the feature-round-2
+  additions since 0.3.0 (real-time collab, tables/lists, HTML
+  importer). 0.3.1 was claimed in one earlier report but never
+  landed in package.json, so it would understate the additions.
+  Left alone deliberately: PROTOCOL_VERSION 0.1.0 (protocol
+  version), registry/moderation entry `version: "0.1.0"` (data
+  format versions). `src-tauri/gen/android/app/tauri.properties`
+  is autogenerated (versionName=0.1.0) and refreshes from
+  tauri.conf.json on the next Android build — verify it reads
+  0.4.0 when the APK is rebuilt for the release.
+
+### Still not verified live (do not claim)
+- Live OAuth sign-in (needs Stanley's runtime client secret),
+  live mail round-trip, live IA upload (needs a test account's
+  own keys), live collab session between two signed-in peers,
+  live REGISTER round-trip under the new issue-based workflow
+  (no Action run has happened anywhere yet), deep-link end-to-end
+  launch, AppImage launch (no /dev/fuse in VM), Windows.exe on
+  real Windows, Android.apk signing + install.

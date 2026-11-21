@@ -1,12 +1,12 @@
 *{box-sizing:border-box}
 [hidden]{display:none!important}
-body{margin:0;font-family:system-ui,sans-serif;color:#111827;background:#fff;overflow-x:hidden}
-html{overflow-x:hidden}
+body{margin:0;font-family:system-ui,sans-serif;color:#111827;background:#fff;overflow-x:clip}
+html{overflow-x:clip}
 /* P6: visible focus on every real control; the body itself (tabindex="-1"
    in index.html) is never a tab stop and never shows a focus ring. */
 :focus-visible{outline:2px solid #2563eb;outline-offset:2px}
 body:focus{outline:none}
-.an-topbar{display:flex;justify-content:space-between;align-items:center;gap:.5rem;padding:.5rem 1rem;background:#111827;color:#fff;flex-wrap:wrap}
+.an-topbar{display:flex;justify-content:space-between;align-items:center;gap:.5rem;padding:.5rem 1rem;background:#111827;color:#fff;flex-wrap:wrap;position:sticky;top:0;z-index:50}
 .an-brand{font-weight:700;flex-shrink:0}
 .an-account{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;justify-content:flex-end;min-width:0;flex:1}
 #guest-badge{background:#374151;border-radius:999px;padding:.15rem .6rem;font-size:.85rem;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}

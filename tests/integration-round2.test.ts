@@ -688,6 +688,21 @@ test("collab Join without a token refuses loudly and makes no network calls", as
   );
 });
 
+test("hunt3: a refused collab join is not overwritten by the next autosave", async () => {
+  const { ui, fakeDoc, fake } = setup({ token: null, login: null });
+  ui.open(collabDoc());
+  elById(fakeDoc, "collab-join-btn").fire("click");
+  await flush();
+  assert.match(statusOf(fakeDoc), /own GitHub token/);
+  // Drive the autosave completion directly: the M4 hold must keep the
+  // refusal readable — before the fix, a pending autosave from an
+  // earlier edit replaced it with "Autosaved locally…" ~500 ms after
+  // the click, so the user never learned why Join did nothing.
+  await (ui as unknown as { autosaveNow: (n: number) => Promise<void> }).autosaveNow(0);
+  assert.match(statusOf(fakeDoc), /own GitHub token/);
+  assert.equal(fake.calls.length, 0, "no GitHub call without a token");
+});
+
 test("collab Join renders peers, a remote peer's cursor mark renders, a conflict note renders, Leave cleans up", async () => {
   const { ui, fakeDoc, fake } = setup({ token: "tok-alice", login: "alice" });
   ui.open(collabDoc());

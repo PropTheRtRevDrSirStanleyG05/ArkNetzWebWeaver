@@ -897,6 +897,11 @@ export class EditorUI {
       // state. L7: the message lives ONLY here — the collab strip
       // stays "Not collaborating." instead of repeating it, so a
       // refused join no longer shows the same error twice.
+      // Hold the status line (M4 pattern): a pending autosave from
+      // an earlier edit must not overwrite the refusal with
+      // "Autosaved locally…" ~500 ms later, or the user never learns
+      // why Join did nothing.
+      this.statusHoldUntil = Date.now() + 10_000;
       const message = err instanceof Error ? err.message : String(err);
       this.setStatus(message);
       return;
@@ -1857,7 +1862,7 @@ export class EditorUI {
 
     const gateNote = document.createElement("p");
     gateNote.className = "an-note";
-    gateNote.textContent = `Signed in as role “${this.role.name}”. Client-side gating only — the GitHub Action that validates commits to site.json.zst / team.json.zst follows with the central repos.`;
+    gateNote.textContent = `Signed in as role “${this.role.name}”. Client-side gating only — no GitHub Action validates commits to site.json.zst / team.json.zst yet.`;
     side.appendChild(gateNote);
     // Role enforcement (B4): a viewer cannot edit the title, add pages,
     // or change per-block visibility from the sidebar either.

@@ -224,7 +224,7 @@ async function renderCurrent(): Promise<void> {
   if (parsed.kind === "demo") {
     currentDoc = cloneDoc(DEMO_SITE);
     currentSiteOwner = null;
-    reader.innerHTML = `<p class="an-note">Demo site bundled with the shell — the registry does not exist yet, so this is not a live network site.</p>` + renderSiteWithSaveBridge(DEMO_SITE);
+    reader.innerHTML = `<p class="an-note">Demo site bundled with the shell — the registry is live but no sites have been published yet, so this is a demo, not a live network site.</p>` + renderSiteWithSaveBridge(DEMO_SITE);
     return;
   }
   if (parsed.kind === "https") {
