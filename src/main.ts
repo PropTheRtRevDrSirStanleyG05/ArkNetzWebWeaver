@@ -18,7 +18,8 @@ import {
   installAppBridgeListener,
 } from "./lib/viewer/app-bridge.js";
 import type { AppBridgeReplyTarget, AppSaveStore } from "./lib/viewer/app-bridge.js";
-import { buildAuthorizeUrl, completeOAuthCallback, randomState, savePendingOAuthState, takePendingOAuthState } from "./lib/auth.js";
+import { buildAuthorizeUrl, completeOAuthCallback, completeDeviceSignIn, pollDeviceToken, randomState, requestDeviceCode, savePendingOAuthState, takePendingOAuthState } from "./lib/auth.js";
+import { openExternalUrl } from "./lib/opener.js";
 import { addGithubAccount } from "./lib/network/accounts.js";
 import { attachMedia, IaUploadQueue } from "./lib/ia-media.js";
 import type { IaKeys } from "./lib/ia-media.js";
@@ -37,6 +38,7 @@ import { siteRepoName } from "./lib/publish.js";
 import type { GithubFetchFn } from "./lib/publish.js";
 import { claimDomainAndOpenSite } from "./lib/domains.js";
 import type { OpenedSite } from "./lib/domains.js";
+import { pageSlugForAddress, sitePageForPath } from "./lib/pages.js";
 import { ClaimWatcher } from "./lib/claim-watcher.js";
 import { buildSiteOpenedViewModel } from "./lib/domains-ui.js";
 import {
@@ -50,6 +52,7 @@ import type { SiteDocument } from "./lib/types.js";
 import { createArkNetzApp } from "./lib/app.js";
 import type { ArkNetzApp } from "./lib/app.js";
 import { installDeepLinkListener, isOAuthCallbackUrl } from "./lib/deep-link.js";
+import { scrollBelowTopbar } from "./lib/scroll.js";
 import { mountPanels } from "./lib/panels.js";
 import { AccountPill } from "./lib/network/account-pill.js";
 import type { PillElement } from "./lib/network/account-pill.js";
@@ -101,6 +104,21 @@ let panelsRefreshNav: (() => void) | null = null;
 // of this, and the reader re-renders from the edited copy on close, so
 // View and Edit always show the same renderer output.
 let currentDoc: SiteDocument = JSON.parse(JSON.stringify(DEMO_SITE)) as SiteDocument;
+/** Sub-page slug of the address the reader is showing ("" = the site
+ *  root). While a sub-page is shown the Edit toggle is disabled:
+ *  the editor publishes the document it opened as the site root, so
+ *  editing a sub-page would overwrite the root with it (hunt 4).
+ *  Sub-page editing lands as its own change, with a page-aware
+ *  publish; until then the toggle says so in its title. */
+let currentPath = "";
+function updateEditToggle(): void {
+  const btn = $("edit-toggle-btn") as HTMLButtonElement;
+  btn.disabled = currentPath !== "";
+  btn.title =
+    currentPath === ""
+      ? "Edit the current site in the visual builder"
+      : "Sub-pages are read-only in this version — go Home to edit the site";
+}
 /** GitHub login that owns the site repo for currentDoc (registry
  *  entry / claim record). Null = unknown (demo site, external link,
  *  or a load whose entry could not be read) — collab join then
@@ -166,21 +184,20 @@ function cloneDoc(doc: SiteDocument): SiteDocument {
   return JSON.parse(JSON.stringify(doc)) as SiteDocument;
 }
 
-function parseAddress(raw: string): { kind: "demo" | "domain" | "https"; value: string } {
+function parseAddress(raw: string): { kind: "demo" | "domain" | "https"; value: string; path: string } {
   const s = raw.trim();
-  if (s === "home" || s === "arknetz://welcome.arknetz") return { kind: "demo", value: s };
+  if (s === "home" || s === "arknetz://welcome.arknetz") return { kind: "demo", value: s, path: "" };
   if (s.startsWith("arknetz://")) {
-    // Any path on the bundled demo domain resolves to the demo site
-    // itself — the demo is a single document with no sub-pages, so
-    // arknetz://welcome.arknetz/about lands on the site instead of an
-    // error page (and, via the T1 interceptor, instead of destroying
-    // the app with a top-level WebView navigation).
+    // A path on the bundled demo domain is a sub-page of the demo
+    // site (hunt 4: it used to resolve to the demo root and the
+    // reader re-rendered the same home document, so the address
+    // changed and the content never did).
     const host = s.slice("arknetz://".length).split("/")[0] as string;
-    if (host === DEMO_SITE.domain) return { kind: "demo", value: s };
-    return { kind: "domain", value: host };
+    if (host === DEMO_SITE.domain) return { kind: "demo", value: s, path: pageSlugForAddress(s, host) };
+    return { kind: "domain", value: host, path: pageSlugForAddress(s, host) };
   }
-  if (s.startsWith("https://")) return { kind: "https", value: s };
-  return { kind: "domain", value: s };
+  if (s.startsWith("https://")) return { kind: "https", value: s, path: "" };
+  return { kind: "domain", value: s, path: "" };
 }
 
 /** Render a site document with save-bridge sessions for its sandboxed
@@ -221,10 +238,17 @@ async function renderCurrent(): Promise<void> {
   const tab = tabs.active();
   if (!tab) return;
   const parsed = parseAddress(tab.address);
+  // The sub-page slug of the address being shown ("" = the site
+  // root). Sub-pages are read-only in the editor for now — editing
+  // one could publish it as the site root — so the Edit toggle is
+  // disabled while one is shown (hunt 4).
+  currentPath = parsed.path;
+  updateEditToggle();
   if (parsed.kind === "demo") {
-    currentDoc = cloneDoc(DEMO_SITE);
+    const page = sitePageForPath(DEMO_SITE, parsed.path);
+    currentDoc = cloneDoc(page);
     currentSiteOwner = null;
-    reader.innerHTML = `<p class="an-note">Demo site bundled with the shell — the registry is live but no sites have been published yet, so this is a demo, not a live network site.</p>` + renderSiteWithSaveBridge(DEMO_SITE);
+    reader.innerHTML = `<p class="an-note">Demo site bundled with the shell — the registry is live but no sites have been published yet, so this is a demo, not a live network site.</p>` + renderSiteWithSaveBridge(page);
     return;
   }
   if (parsed.kind === "https") {
@@ -235,7 +259,8 @@ async function renderCurrent(): Promise<void> {
   reader.innerHTML = `<p>Loading ${parsed.value}…</p>`;
   try {
     const site = await resolver.loadSite(parsed.value);
-    currentDoc = cloneDoc(site);
+    const page = sitePageForPath(site, parsed.path);
+    currentDoc = cloneDoc(page);
     // The registry entry knows the site repo's owner — collab join
     // addresses the owner's repo, so a non-owner collaborator joins
     // the right repo. Best-effort: the shard fetch is cached, and a
@@ -246,7 +271,7 @@ async function renderCurrent(): Promise<void> {
     } catch {
       currentSiteOwner = null;
     }
-    reader.innerHTML = renderSiteWithSaveBridge(site);
+    reader.innerHTML = renderSiteWithSaveBridge(page);
   } catch (err) {
     currentSiteOwner = null;
     reader.innerHTML = `<h1>Could not load ${parsed.value}</h1><p>${err instanceof Error ? err.message : String(err)}</p><p class="an-note">The central registry repos do not exist yet (licence decision pending). Until they do, only the demo site resolves.</p>`;
@@ -396,12 +421,15 @@ async function switchAccount(
 }
 
 /** Start the GitHub OAuth sign-in: build the authorize URL (client id
- *  + redirect_uri + scopes + random state) and open it. The pending
- *  state is saved to localStorage so the callback can be validated
- *  even if the OS delivers it to a second app process (see auth.ts).
- *  Throws loudly, with the exact fix, when no client id is
+ *  + redirect_uri + scopes + random state) and open it in the SYSTEM
+ *  browser through the opener plugin — never inside the app WebView
+ *  (hunt 4: window.open kept GitHub in-app, where the nav guard
+ *  blocks the arknetz:// callback, so sign-in could never return).
+ *  The pending state is saved to localStorage so the callback can be
+ *  validated even if the OS delivers it to a second app process (see
+ *  auth.ts). Throws loudly, with the exact fix, when no client id is
  *  configured — never a broken URL, never a fake token. */
-function startGitHubSignIn(): void {
+function startRedirectSignIn(): void {
   const status = $("signin-status");
   // B8: the status lives in its own strip below the topbar (hidden
   // until there is a message) — show it when we have something to say.
@@ -413,9 +441,117 @@ function startGitHubSignIn(): void {
     const state = randomState();
     savePendingOAuthState(state);
     const url = buildAuthorizeUrl(state);
-    showStatus("Opening GitHub sign-in…");
-    window.open(url, "_blank", "noopener");
+    showStatus("Opening GitHub sign-in in your browser…");
+    void openExternalUrl(url).then((tookPlugin) => {
+      if (!tookPlugin) {
+        showStatus("Opening GitHub sign-in… if nothing opened, open this URL by hand: " + url);
+      }
+    });
   } catch (err) {
+    showStatus(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Set to true by the Cancel button while a device-flow poll is
+ *  running; the poll's sleep function throws on the next wait, which
+ *  ends the poll as a cancellation instead of a token. */
+let deviceFlowCancelled = false;
+
+/** Start GitHub sign-in with the DEVICE flow (hunt 4, BUG 1 — the
+ *  primary path). It needs only the client id: no client secret, no
+ *  redirect URI, no deep link — so it is the only sign-in that can
+ *  complete on a phone, where the redirect flow's secret can never
+ *  exist. The app shows the short code, opens github.com/device in
+ *  the system browser, and polls until GitHub issues the token.
+ *  If Device Flow is not enabled on the OAuth App yet, GitHub answers
+ *  device_flow_disabled: the strip shows the exact checkbox to enable
+ *  and offers the redirect sign-in as a fallback (which still needs
+ *  the client secret on desktop via the environment variable). */
+async function startGitHubSignIn(): Promise<void> {
+  const status = $("signin-status");
+  const showStatus = (msg: string): void => {
+    status.textContent = msg;
+    status.hidden = false;
+  };
+  // A fresh attempt clears any previous device-code UI.
+  status.replaceChildren();
+  showStatus("Starting GitHub sign-in…");
+  let code;
+  try {
+    code = await requestDeviceCode();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    showStatus(message);
+    if (/Device Flow is not enabled/.test(message)) {
+      const fallback = document.createElement("button");
+      fallback.type = "button";
+      fallback.textContent = "Try redirect sign-in instead";
+      fallback.onclick = () => startRedirectSignIn();
+      status.appendChild(document.createTextNode(" "));
+      status.appendChild(fallback);
+    }
+    return;
+  }
+  // Show the code + actions. The code comes from GitHub, so it is
+  // inserted as text, never HTML.
+  deviceFlowCancelled = false;
+  status.replaceChildren();
+  const intro = document.createElement("span");
+  intro.textContent = `GitHub sign-in: enter code `;
+  const codeEl = document.createElement("code");
+  codeEl.textContent = code.userCode;
+  const at = document.createElement("span");
+  at.textContent = ` at github.com/device, then wait here — this page completes itself. `;
+  const openBtn = document.createElement("button");
+  openBtn.type = "button";
+  openBtn.textContent = "Open github.com/device";
+  openBtn.onclick = () => {
+    void openExternalUrl(code.verificationUri).then((tookPlugin) => {
+      if (!tookPlugin) {
+        showStatus(`If nothing opened, open ${code.verificationUri} by hand and enter code ${code.userCode}.`);
+      }
+    });
+  };
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.onclick = () => {
+    deviceFlowCancelled = true;
+  };
+  status.append(intro, codeEl, at, openBtn, document.createTextNode(" "), cancelBtn);
+  status.hidden = false;
+  // Offer the browser immediately as well as on button press — the
+  // user asked to sign in, so opening the page is the expected step.
+  void openExternalUrl(code.verificationUri);
+  try {
+    const token = await pollDeviceToken(code.deviceCode, {
+      intervalSec: code.interval,
+      deadlineMs: Date.now() + code.expiresIn * 1000,
+      sleepFn: async (ms: number) => {
+        if (deviceFlowCancelled) throw new Error("cancelled");
+        await new Promise<void>((r) => setTimeout(r, ms));
+        if (deviceFlowCancelled) throw new Error("cancelled");
+      },
+    });
+    const { user } = await completeDeviceSignIn(token);
+    githubToken = token;
+    githubLogin = user.login;
+    if (app?.keyring.isUnlocked) {
+      await addGithubAccount(app.keyring, user, token);
+      showStatus(`Signed in with GitHub as ${user.login} — account saved in the keyring.`);
+    } else {
+      showStatus(`Signed in with GitHub as ${user.login} for this session. The keyring is locked, so the account is not saved yet — unlock the keyring in the Accounts panel to keep it signed in.`);
+    }
+    refreshGithubStatus();
+    panelsRefreshNav?.();
+  } catch (err) {
+    githubToken = null;
+    githubLogin = null;
+    refreshGithubStatus();
+    if (err instanceof Error && err.message === "cancelled") {
+      showStatus("GitHub sign-in cancelled — no account was created.");
+      return;
+    }
     showStatus(err instanceof Error ? err.message : String(err));
   }
 }
@@ -458,7 +594,15 @@ async function completeGitHubSignIn(callbackUrl: string): Promise<void> {
     githubToken = null;
     githubLogin = null;
     refreshGithubStatus();
-    showStatus(err instanceof Error ? err.message : String(err));
+    let message = err instanceof Error ? err.message : String(err);
+    // Hunt 4: the common mobile failure is the missing client secret
+    // (the redirect exchange needs one and a phone has none). Point
+    // at the sign-in that needs no secret instead of leaving the user
+    // with a dead end.
+    if (/not_configured/.test(message)) {
+      message += " On this device, use the device sign-in instead — it needs no client secret (tap “Sign in with GitHub” again).";
+    }
+    showStatus(message);
   }
 }
 
@@ -552,6 +696,8 @@ function wireSettings(): void {
  *  shows the new site instead of the old one. */
 function handleSiteOpened(opened: OpenedSite): void {
   currentDoc = cloneDoc(opened.doc);
+  currentPath = "";
+  updateEditToggle();
   // The claim record knows the site repo's owner (the claimer) —
   // collab join addresses that repo.
   currentSiteOwner = opened.registryEntry.owner;
@@ -559,7 +705,7 @@ function handleSiteOpened(opened: OpenedSite): void {
   ($("reader") as HTMLElement).hidden = true;
   ui.showSiteOpened(opened);
   startClaimWatcher(opened);
-  ($("editor") as HTMLElement).scrollIntoView({ block: "start" });
+  scrollBelowTopbar($("editor") as HTMLElement);
 }
 
 /** Watch the filed claim's REGISTER issue until it closes (D3): the
@@ -647,7 +793,10 @@ async function init(): Promise<void> {
     void go(href);
   }, {
     openExternal: (href) => {
-      window.open(href, "_blank", "noopener");
+      // Hunt 4: through the opener plugin, so an external link leaves
+      // the app for the system browser instead of opening a second
+      // in-app window (or nothing at all, on Android).
+      void openExternalUrl(href);
     },
   });
 
@@ -691,6 +840,29 @@ async function init(): Promise<void> {
     showReader: () => {
       ($("editor") as HTMLElement).hidden = true;
       ($("reader") as HTMLElement).hidden = false;
+    },
+    // Hunt 4 M4: a panel replaces the page instead of stacking above
+    // it — while a non-browse, non-builder panel is active the main
+    // layout (reader + sidebar + editor) is hidden, so a panel never
+    // reads as one endless page with the whole site underneath it.
+    // Browse shows the reader, Builder shows the editor (both live
+    // inside main, so it stays visible for those two).
+    onPanelShown: (panelId) => {
+      const main = document.querySelector("main.an-layout") as HTMLElement | null;
+      // Hunt 4 regression watch: showPanel runs once on MOUNT (Browse),
+      // and on mount main was never hidden — scrolling the reader then
+      // yanks a fresh load ~1300px down the page, past the toolbar,
+      // panels and sidebar. Only scroll when we are RETURNING from a
+      // hidden main (another panel was showing).
+      const wasHidden = main?.hidden ?? false;
+      if (main) main.hidden = panelId !== "browse" && panelId !== "builder";
+      // The view switch scrolls its content below the topbar too:
+      // the Builder click opens the editor BEFORE this runs (its own
+      // scroll fires while main is still hidden), so the scroll that
+      // counts is this one, after main is visible again.
+      if (!wasHidden) return;
+      if (panelId === "browse") scrollBelowTopbar($("reader") as HTMLElement);
+      if (panelId === "builder") scrollBelowTopbar($("editor") as HTMLElement);
     },
     showEditor: () => ($("edit-toggle-btn") as HTMLButtonElement).click(),
   });
@@ -753,7 +925,7 @@ async function init(): Promise<void> {
     // B1 (belt & braces with the grid placement in styles.css): the
     // editor replaces the reader in the same grid cell, and the view
     // scrolls to it so a first-time user never sees a blank page.
-    ($("editor") as HTMLElement).scrollIntoView({ block: "start" });
+    scrollBelowTopbar($("editor") as HTMLElement);
   };
   document.addEventListener("arknetz:editor-closed", () => {
     // Closing the editor ends the pending-claim watch too: nothing
@@ -763,7 +935,7 @@ async function init(): Promise<void> {
     if (editorUi?.doc) currentDoc = cloneDoc(editorUi.doc);
     ($("reader") as HTMLElement).hidden = false;
     ($("reader") as HTMLElement).innerHTML = renderSiteWithSaveBridge(currentDoc);
-    ($("reader") as HTMLElement).scrollIntoView({ block: "start" });
+    scrollBelowTopbar($("reader") as HTMLElement);
   });
 
   ($("media-input") as HTMLInputElement).addEventListener("change", (e) => {

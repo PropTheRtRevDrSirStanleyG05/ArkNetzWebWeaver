@@ -2048,3 +2048,313 @@ hunt 1), not from inside the clone.
   (no Action run has happened anywhere yet), deep-link end-to-end
   launch, AppImage launch (no /dev/fuse in VM), Windows.exe on
   real Windows, Android.apk signing + install.
+
+### Hunt 3 delivery record
+- Tests: 627 -> **629 pass, 0 fail** (2 new: sticky-topbar +
+  single-version footer in app.test.ts; collab-join hold in
+  integration-round2.test.ts; B7 assertion updated to
+  `overflow-x: clip`).
+- Client re-pushed 2026-11-21 ~21:35: commit
+  **fde9aaa63a08f00c9dc59350115c74a4ef573262** (13 files, read-back
+  verified live: package.json version 0.4.0, tauri.conf.json
+  0.4.0, footer "ArkNetzWebWeaver 0.4.0").
+- Protocol-root re-pushed: commit
+  **246735afa2af5daa402f595201f73b5bed2fe791** (manifest.json +
+  README.md; live manifest now `pendingRepos: []`).
+- Linux artifacts rebuilt (tauri build exit 0, version 0.4.0 in
+  filenames): **ArkNetzWebWeaver_0.4.0_amd64.deb 4,526,154 B**,
+  **ArkNetzWebWeaver_0.4.0_amd64.AppImage 83,171,832 B**,
+  ArkNetzWebWeaver-0.4.0-1.x86_64.rpm 4.32 MiB, binary
+  11,645,672 B. The VM had reset since hunt 1: Tauri -dev
+  packages were gone and the Hatch-patched libzstd1 was back —
+  reinstalled the deps and re-downgraded libzstd1 to stock
+  1.5.5+dfsg2-2build1.1 (backup .so still at
+  build/sysdeps-backup/libzstd.so.1.5.5); a future VM reset will
+  need the same two steps again.
+- Real Tauri binary launched under Xvfb and screenshotted
+  (qa-screenshots/hunt3/53-tauri-0.4.0-xvfb.png): renders
+  correctly, topbar pinned with brand + Guest pill + Sign in.
+  AppImage launch still unverified (no /dev/fuse in VM).
+
+---
+
+## P2P phase 1 — optional WebRTC transport core (2026-11-21, NEW FILES ONLY)
+
+Stanley decided 2026-11-21 14:18: **"Do it all"** — every P2P
+surface, not just one. Phase 1 is the transport core + spec only:
+**new files under `src/lib/p2p/` + new tests + `P2P-SPEC.md`** at
+the repo root (`~/workspace/arknetzwebweaver/P2P-SPEC.md`). No
+existing file was edited (a bug-hunt agent was editing the same
+scaffold at the time). **No wiring into the app yet** — that is
+phase 2, after bug hunt 3 lands. No push, no release, no keystore
+touch, no dictionary touch (separate drop job queued).
+
+**Design, in one paragraph:** optional WebRTC data channels, OFF by
+default, GitHub stays the fallback and the source of truth for every
+feature. No central server. No shared/master keys — each user still
+signs in with their own per-backend accounts. Signaling goes through
+GitHub: registry/contacts entries carry a peer advertisement (public
+peer ID + capabilities, never a private key), and peers connect
+directly after that. Payloads reuse the app's existing encryption:
+site bundles are public content (verified on receipt), collab edits
+ride the channel as they ride the branch, mail reuses the X25519
+wrapped-key scheme, drive chunks are AES-256-GCM before they leave
+the device.
+
+**Files** (`src/lib/p2p/`, 13 files + README):
+
+| File | What it does |
+|---|---|
+| `types.ts` | `P2PSettings` + `defaultP2PSettings` (everything off; maxPeers 8; maxUploadKBps 512), `P2PTurnConfig`, `PeerAd`, `SignalMessage`, `ControlMessage` union, channel labels `arknetz/site`, `arknetz/collab`, `arknetz/mail`, `arknetz/drive` |
+| `ice.ts` | No-account ICE assembly + diagnostics (§7 below) |
+| `identity.ts` | `generatePeerId` (16 random bytes → 32 hex), `buildPeerAd` / `parsePeerAd` (1 h TTL, future-skew guard, domain/owner pinning), `peerAdUrl` (raw.githubusercontent.com, site repo, `peer-ad.json`) |
+| `signaling.ts` | `SignalingClient` — fetch/publish ads via Contents API (SHA guard), sealed signal Issues (`ARKNETZ-SIGNAL <id>`, label `arknetz-signal`, ```` ```arknetz-signal ```` fence, sealed with `sealBytesForRecipient` to the recipient's X25519 mail key), poll + skip-counting |
+| `transport.ts` | `P2PConnection` interface, `LoopbackConnectionFactory` (in-memory paired connections, same ordering/close semantics — the test double), `WebRtcConnectionFactory` (browser-only; throws a plain error in Node) |
+| `transfer.ts` | Frame codec (`0x01` JSON control / `0x02` chunk, 16 KiB chunks), SHA-256 verification, missing-chunk retry (fixed during testing: originally only checked on count-complete, which would have hung on a dropped middle chunk), token bucket (default 512 KiB/s), caps: site 25 MB, mail 10 MB, drive chunk 10 MB+28, collab batch 1 MB |
+| `peer-manager.ts` | Settings, handshake state machine, glare rule (smaller peerId keeps its initiated connection), 30 s handshake / 10 s hello / 60 s silence / 5 min keep timeouts, session-only block-list, 3-strikes disconnect |
+| `site-sharing.ts` | Serve cached bundle only; fetch verifies SHA-256 when supplied + always decompresses + parses the site document and checks its `domain` equals the requested domain; null = CDN fallback. **Honest gap:** registry entries carry no content hash, so a first-time fetch cannot be verified against the registry pointer — needs a protocol change (`siteSha256` on registry entries), flagged, not claimed. |
+| `collab-p2p.ts` | `hello` / `op` / `cursor` control messages; existing `diffBlocks` / `applyBlockOps` (per-block last-write-wins on `(updatedAt, author)`); team-login filter on incoming ops/cursors; branch relay stays authoritative |
+| `mail-p2p.ts` | Sealed envelope (`sealMail`) sent as one transfer; receiver parses with the same validation as an inbox Issue; `transfer-done { ok: true }` is the receipt; no peer / no receipt → Issue inbox exactly as today |
+| `drive-p2p.ts` | Stored chunk bytes only (`iv | ciphertext`); vault-id gate (unknown vault refused before transfer); receiver re-verifies via existing `decryptChunk` |
+| `index.ts` / `README.md` | Barrel exports; module readme (file table, rules, tests) |
+
+**Tests** (`tests/p2p-*.test.ts`, 7 files): ice, identity,
+signaling, transport, transfer, peer-manager, adapters. **49 P2P
+tests, all passing; full suite 704 pass, 0 fail** (`npm run build`
+exit 0, `npm test` exit 0, 2026-11-21). Real WebRTC is NOT tested:
+Node has no WebRTC (verified: `RTCPeerConnection` is `undefined` on
+Node v24.22.1, `--experimental-webrtc` is not a valid flag), so the
+loopback factory is the test double and real peer connections need
+two real devices in phase 2.
+
+**TURN — the 14:22 decision (Stanley): add ALL the ICE/TURN options
+that work WITHOUT creating any account.** No personal accounts of
+his used to create keys, no signups in his name. Wired into
+`ice.ts` (`assembleIceServers`):
+
+- **STUN, default on, 9 servers in order:** Google
+  `stun.l.google.com:19302` + `stun1`–`stun4` on `:19302`,
+  `stun:stun.cloudflare.com:3478` (Cloudflare states free and
+  unlimited), `stun:openrelay.metered.ca:80`,
+  `stun:stun.stunprotocol.org:3478`, `stun:freeturn.net:3478`.
+  **Twilio STUN dropped** — one source claims it needs API
+  credentials; it could not be probed from this VM, so per the
+  "include only if it answers" rule it is out.
+- **TURN fallback, freeturn.net** — `turn:freeturn.net:3478` +
+  `turns:freeturn.net:5349`, `free`/`free`. Included by default when
+  TURN is on, labelled "community-run, no SLA, not a production
+  dependency".
+- **TURN opt-in fallback, Open Relay demo credential** —
+  `turn:openrelay.metered.ca:80` + `turns:openrelay.metered.ca:443`,
+  `openrelayproject`/`openrelayproject` (published in Metered's own
+  docs). Behind the `useOpenRelayDemo` toggle, **off by default**,
+  labelled "community shared credential — anyone can use it, quota
+  is shared, may be rate-limited or revoked". Never the default,
+  never presented as private; inert unless the master TURN switch
+  is on.
+- **Static-auth explicitly NOT used** (`staticauth.openrelay.metered.ca`)
+  — shared credential for self-hosted servers, not clients.
+- **Per-user credential fields stay empty-by-default** (Metered API
+  key, Cloudflare TURN, custom TURN) for users who bring their own
+  keys. `meteredOwnTurnServers(apiKey)` deliberately returns `[]` —
+  a bare API key is not a TURN entry; real entries come from
+  Metered's API response (phase-2 wiring point).
+- **Why this does not break the no-shared-keys rule:** freeturn and
+  demo credentials are public, published by their operators for
+  anyone to use, with no account behind them and no secret of
+  Stanley's (or any user's) involved. Nothing personal of his was
+  used — no account created, no signup, no email.
+- **Settings UI note + diagnostics** (specified in P2P-SPEC.md
+  §7.6, constants in `ice.ts`): plain-words note that relayed
+  traffic passes through the relay operator's servers, content is
+  DTLS-encrypted so the operator cannot read it, but the operator
+  sees both peers' IPs; and a diagnostics line naming the ICE path
+  that succeeded (`direct (host)` / `direct (srflx)` / `relayed via
+  freeturn.net` / `relayed via openrelay.metered.ca (demo
+  credential)` / `relayed via your own TURN server` /
+  `loopback (test only)` / `unknown`).
+
+**Endpoint verification (2026-11-21): no server probed live from
+this VM.** Hand-built STUN binding (RFC 5389) + TURN allocate
+(RFC 5766) probes: all UDP sends fail EPERM (VM blocks UDP egress),
+all TCP reset by the egress proxy, TLS to freeturn.net:5349 fails
+(proxy speaks plain HTTP). Uniform across every endpoint including
+Google's STUN — the block is local to the VM, not per-server. DNS
+resolves for all hosts (via proxy). curl HTTPS: metered.ca/tools/
+openrelay/ → 200; freeturn.net → 000; openrelay.metered.ca → 000.
+Credentials confirmed independently by web search from live sources
+(freeturn `free`/`free` per Mozilla bug tracker; demo credential per
+Metered docs, RomM docs, dev.to, GitHub READMEs). **Runtime ICE
+gathering + the diagnostics line on a real device is the real
+verification**; a server that does not answer simply drops out of
+the fallback order.
+
+**Phase 2 wiring points** (P2P-SPEC.md §13): `app.ts` panel wiring
+(settings persistence in IndexedDB per device, settings panel,
+peer-ID rotation/reset, per-feature toggles); site reader try-peer-
+first then `RegistryResolver.loadSite`; collab session start
+`P2PCollabSession` alongside the relay poll (slow the poll while
+P2P is connected; team check before accepting); mail compose/send
+try `MailP2P.deliver` when the recipient is an online peer, inbox
+poller also polls `arknetz-signal` Issues; ArkDrive sync offer
+`DriveP2P` between own devices (repo blobs stay the durable copy);
+`PROTOCOL.md` §16 merge + `peer-ad.json` in the repo topology;
+manual verification on real devices (two browsers, different
+networks, one behind a symmetric NAT, with and without TURN).
+
+**Open decisions for Stanley:** none blocking phase 2 — the TURN
+default question is settled by the 14:22 decision. The remaining
+protocol decision is the optional `siteSha256` on registry entries
+for first-time site-fetch verification (§8.1 honest gap).
+
+## Bug hunt 4 (hunt 4 in the notes) — LIVE v0.4.0 → 0.4.1, 2026-11-21
+
+Trigger: Stanley's 14:13 PST report from his Pixel 7 Pro — (1) "Sign in
+with GitHub opens GitHub sign in but it doesn't redirect to the
+authenticated app", (2) "the UI kinda looks like shit rn at least on
+mobile". Folded in from the 0.4.0 benchmark: (3) in-app reader sub-page
+nav broken for the demo site (0/5), (4) static export nav links are dead
+`arknetz://` URLs in a normal browser. NOT acted on: the Lighthouse 100
+regression (91 on `/` — a reporting correction) and the zstd v2
+dictionary saving zero bytes (Stanley's decision, queued after hunt 3).
+Full record: `qa-screenshots/hunt4/HUNT4-NOTES.md` (audit in
+`hunt4/mobile/`, re-verification in `hunt4/recheck/`).
+
+Live verification first: live client clone at head
+`fde9aaa63a08f00c9dc59350115c74a4ef573262` — source code ZERO drift vs the
+scaffold (only this file differs: the scaffold has the Hunt 3 delivery
+record the live repo lacks — included in the re-push).
+
+### BUG 1 — OAuth sign-in never returns (root causes, all verified)
+
+1. No opener plugin: `window.open(url, "_blank")` with no
+   tauri-plugin-opener behind it. On Android the generated
+   `RustWebChromeClient.kt` has NO `onCreateWindow` and
+   `setSupportMultipleWindows` is never set, so `window.open` is a
+   silent no-op.
+2. Rust nav guard (`should_block_top_level_navigation` in lib.rs)
+   blocks ANY top-level `arknetz://` navigation in-app, so the
+   `arknetz://oauth/callback` redirect can never be delivered.
+3. The code exchange reads the client secret ONLY from env var
+   `ARKNETZ_GITHUB_OAUTH_CLIENT_SECRET`, which cannot exist inside a
+   released APK — even a delivered callback fails with `not_configured`.
+4. The OS return path itself is FINE (released 0.4.0 APK manifest has
+   the deep-link intent filter; `MainActivity` → `TauriActivity` →
+   `onNewIntent`; `tauri.conf.json` mobile deep-link config present;
+   `launchMode="singleTask"`).
+5. Live GitHub endpoint tests (Client ID `Ov23lic8terv0XOd3GDe`):
+   device-code request → `device_flow_disabled`; token exchange with
+   bogus code + code_verifier and NO secret → `incorrect_client_credentials`
+   (PKCE does NOT let this OAuth App exchange without the secret);
+   authorize URL GET → HTTP 302 to github.com/login, no redirect_uri
+   mismatch.
+
+Fix: GitHub **device flow as the primary sign-in** (client id only — no
+secret, no redirect, no deep link) + **opener plugin** (GitHub opens in
+the system browser) + redirect flow kept as fallback for desktop
+env-var users. `src/lib/auth.ts`: `requestDeviceCode()`,
+`pollDeviceToken()`, `completeDeviceSignIn()`; `src/lib/opener.ts`
+(new): `openExternalUrl()`; `src-tauri/Cargo.toml`:
+`tauri-plugin-opener = "2"` + `.plugin(tauri_plugin_opener::init())` +
+`"opener:default"` capability; `src/main.ts`: `startGitHubSignIn()`
+rewritten as async device-flow primary (code + "Open github.com/device"
++ "Cancel" in `#signin-status`, auto-open via opener, cancellable poll),
+old behaviour preserved as `startRedirectSignIn()`. Tests: +8 auth, +3
+opener (new file).
+
+Live proof: the app's own compiled `requestDeviceCode` against live
+GitHub threw exactly "Device Flow is not enabled on this OAuth App.
+Enable it in the OAuth App settings (…), then try again." — the client
+code works; the gate is the checkbox. **Stanley's decision still needed:
+enable Device Flow on the OAuth App, or sign-in on the phone stays
+broken.** Device-flow UI verified in headless Chrome with a stubbed
+fetch (strip visible, code shown, Open + Cancel present). Cargo check
+for the opener plugin registration is NOT yet compile-verified: the
+VM/service restart wiped the Tauri `-dev` system packages and the
+reinstall was still running at the end of this hunt (apt-get update took
+~2 min at ~7 KB/s through the egress proxy).
+
+### Benchmark finding 1 — reader sub-page nav (FIXED)
+
+`parseAddress()` mapped ANY path on `welcome.arknetz` to kind "demo"
+and `renderCurrent()` always rendered the whole `DEMO_SITE`.
+`SiteDocument` now has optional `pages?: Record<string, SiteDocument>`
+(types.ts); `src/lib/pages.ts` (new): `pageSlugForAddress()` +
+`sitePageForPath()`; `DEMO_ABOUT` + `pages: { about: DEMO_ABOUT }` in
+sample.ts; main.ts resolves via `sitePageForPath` (unknown slug → root
+doc). Edit toggle is DISABLED on sub-pages (read-only in this version —
+the editor publishes the document it opened as the site root, so editing
+a sub-page would overwrite the root with it). Verified in headless
+Chrome at 360/390/412: clicking "About the protocol" → address
+`arknetz://welcome.arknetz/about`, H1 "About the protocol". Tests:
+`tests/pages.test.ts` (new, 4 tests).
+
+### Benchmark finding 2 — export arknetz:// links dead (FIXED)
+
+`RenderOptions.rewriteHref?` (renderer.ts, applied after the allow-list
+check; `data-arknetz-link` marker computed from the FINAL href);
+`exportStaticFiles` rewrites same-domain arknetz:// links to relative
+URLs per page depth; cross-domain links stay as-is; favicon/stylesheet
+links relative too (depth-aware `../` prefix); sub-page body from
+`doc.pages?.[slug]` when present. Tests: +2 export, +2 renderer.
+
+### BUG 2 — mobile UI (audit: 10 defects, all fixed and re-verified)
+
+Audit: `hunt4/mobile/MOBILE-AUDIT.md` (360/390/412 × 844, DSF 2, touch).
+- **H1 (HIGH)** panel heading under the sticky topbar on load/switch —
+  `src/lib/scroll.ts` (new): `scrollBelowTopbar()` measures the real bar
+  height; `showPanel` uses it instead of `scrollIntoView`. Verified: h2
+  top 212–269px vs topbar bottom 57–60px.
+- **H2 (HIGH)** editor Back button under the topbar — all 3
+  `scrollIntoView` calls in main.ts replaced. Verified: Back top 73–77px.
+- **M1** code blocks clipped — READER_CSS + `pre.an-ed-text` wrap on
+  narrow screens (`overflow-wrap:break-word`, NOT `anywhere` — the first
+  draft used `anywhere` and tripped the B9-nit guard in app.test.ts).
+- **M2** tap targets ~28px — 44px min-height/min-width rules in
+  styles.css. Verified: editor bar buttons all 44px.
+- **M3** topbar two rows at 360px (80px) — one-row rule under 400px.
+  Recheck follow-ons: Guest pill wrapped mid-word ("Gues / t") → pill
+  nowrap + ellipsis; brand `flex-shrink:0` stopped it truncating so the
+  pill squeezed to "Gu…" → `flex-shrink:1` + smaller brand/sign-in.
+  Final 360px topbar: full brand, full "Guest", full "Sign in with
+  GitHub", one row, 57px.
+- **M4** panels stacked above the full reader — `onPanelShown` hides
+  `main.an-layout` except Browse/Builder. Verified: hidden on Mail,
+  visible on Browse.
+- **M5** format toolbar below the fold after tapping text — wrap click
+  handler scrolls the block's `.an-fmt-bar` into view ONLY when hidden.
+  Verified with a real below-fold tap: fmt bar y=994 → y=68 (topbar
+  bottom 60).
+- **L1** ToS checkbox 13px → 20×20 + `accent-color:#2563eb`. Verified.
+- **L2** Wayback placeholder truncated at 360px → `https://…/site.json.zst`
+  (verified in shipped dist; panel is `needsSignIn`, guest-hidden).
+- **L3** disabled button low-contrast → `color:#4b5563;background:#f3f4f6;
+  opacity:1`. Verified.
+- **Hunt-4 regression caught by the recheck (own goal, fixed):** the M4
+  `onPanelShown` browse-scroll fired on MOUNT too, yanking a fresh load
+  ~1300px down (fresh scrollY 1274–1413). Fix: `showPanel(panelId,
+  scroll = true)` with the mount call passing `false`, and `onPanelShown`
+  only scrolls when main WAS hidden. Verified: fresh load scrollY 0 at
+  all widths. No horizontal overflow at any width; Hunt 2 #1/#9/#11 and
+  Hunt 3 #1 still hold.
+
+### Battery and version
+
+- Battery: **704 pass, 0 fail** (final run 2026-11-21 ~23:00 UTC;
+  `tsc --noEmit` exit 0; was 629 at 0.4.0, +75 tests incl. 26 hunt-4
+  and the P2P phase-1 suite). NOTE: a mid-hunt full run showed 701/704
+  with `tsc` errors in peer-manager/signaling/transport — a STALE dist
+  built while the sibling P2P agent was mid-write (its files finished
+  changing 22:35 UTC); the source tree was never red after that. This
+  hunt touched NO p2p file. Re-push: unblocked (see below). No release
+  created; keystore untouched.
+- Version bumped to **0.4.1** (patch) — package.json, tauri.conf.json,
+  Cargo.toml, footer, hunt-3 version test. PROTOCOL_VERSION 0.1.0 left.
+
+### Still needs a real-device check (only Stanley)
+
+OAuth on a real phone (enable Device Flow first — see above); APK
+install on a real device (0.4.1 never built as a release — no `tauri
+build` was run per the benchmark constraint); `cargo check` for the
+opener plugin after the system-deps reinstall; live REGISTER round-trip
+(no GitHub Action has run anywhere yet); live mail/IA/collab round-trips.

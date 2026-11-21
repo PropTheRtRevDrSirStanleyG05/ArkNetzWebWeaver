@@ -4,6 +4,41 @@
 // NOT a real site from the network.
 import type { SiteDocument } from "./types.js";
 
+/** The demo's About page (hunt 4: the nav linked here but the reader
+ *  always rendered the home document, so the address changed and the
+ *  content never did). Real content, shared by the reader and the
+ *  static export — both resolve it from DEMO_SITE.pages["about"]. */
+export const DEMO_ABOUT: SiteDocument = {
+  domain: "welcome.arknetz",
+  title: "About the protocol",
+  theme: { layout: "docs", accent: "#2563eb", font: "system-ui" },
+  nav: [
+    { label: "Home", href: "arknetz://welcome.arknetz" },
+    { label: "About the protocol", href: "arknetz://welcome.arknetz/about" },
+  ],
+  blocks: [
+    { type: "h2", text: "What ArkNetz is" },
+    {
+      type: "p",
+      text: "ArkNetz is a zero-server web: sites are small typed JSON documents stored in public GitHub repositories, media lives on the Internet Archive, and the app in your hand is the browser, the builder, and the reader in one. There is no server to run and no hosting bill — the network is the repos.",
+    },
+    { type: "h2", text: "How a site loads" },
+    {
+      type: "p",
+      text: "A domain is looked up in a sharded registry — sixteen public repos, one per first hex digit of the domain's SHA-256. The registry entry points at the site's own repo; the site document is fetched from raw.githubusercontent.com, cached with ETags, and decompressed with Zstd. A repeat visit transfers nothing.",
+    },
+    { type: "h2", text: "Who stores what" },
+    {
+      type: "p",
+      text: "Text and structure live in GitHub repos. Images, audio, and video live on the Internet Archive under the publisher's own account. Your drafts, keys, and reading lists live on your device, in IndexedDB — the network never sees them.",
+    },
+    {
+      type: "quote",
+      text: "This demo site is bundled with the app so guest browsing works with no network at all. Real sites resolve through the registry — none have been published yet.",
+    },
+  ],
+};
+
 export const DEMO_SITE: SiteDocument = {
   domain: "welcome.arknetz",
   title: "Welcome to ArkNetzWebWeaver",
@@ -12,6 +47,7 @@ export const DEMO_SITE: SiteDocument = {
     { label: "Home", href: "arknetz://welcome.arknetz" },
     { label: "About the protocol", href: "arknetz://welcome.arknetz/about" },
   ],
+  pages: { about: DEMO_ABOUT },
   blocks: [
     {
       type: "hero",

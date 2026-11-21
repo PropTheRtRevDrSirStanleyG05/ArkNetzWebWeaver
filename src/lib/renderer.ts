@@ -113,6 +113,14 @@ export function installArknetzLinkInterceptor(
 export interface RenderOptions {
   appBridgeToken?: string;
   appBridgeTokens?: ReadonlyMap<string, string>;
+  /** Rewrite a safe href before it is emitted — the static export
+   *  uses it to turn same-domain arknetz:// links into relative URLs
+   *  (hunt 4: arknetz:// hrefs are dead in a normal browser, so an
+   *  exported site's nav did nothing). In-app rendering passes no
+   *  rewriter, so arknetz:// hrefs stay as-is and the shell's link
+   *  interceptor keeps routing them internally. The rewriter MUST
+   *  return a safe href; it runs after the allow-list check. */
+  rewriteHref?: (href: string) => string;
 }
 
 function appBridgeTokenFor(block: BlockNode, options?: RenderOptions): string | undefined {
@@ -123,9 +131,18 @@ function appBridgeTokenFor(block: BlockNode, options?: RenderOptions): string | 
 
 /** Render a block's text field: inline runs when the block carries
  *  formatting, plain escaped text otherwise. */
-function renderText(block: BlockNode): string {
-  if (block.runs && block.runs.length > 0) return renderInlineRuns(block.runs);
+function renderText(block: BlockNode, options?: RenderOptions): string {
+  if (block.runs && block.runs.length > 0) return renderInlineRuns(block.runs, options?.rewriteHref);
   return escapeHtml(block.text ?? "");
+}
+
+/** A safe href, rewritten when the caller supplied a rewriter. The
+ *  data-arknetz-link marker is computed from the FINAL href, so an
+ *  exported relative link carries no marker (there is no interceptor
+ *  in a static export) while an in-app arknetz:// link keeps it. */
+function outHref(raw: string | null | undefined, options?: RenderOptions): string {
+  if (!raw) return "#";
+  return options?.rewriteHref ? options.rewriteHref(raw) : raw;
 }
 
 /** Plain text of a block (runs or text), for diffs and summaries. */
@@ -197,27 +214,27 @@ function renderBlockInner(block: BlockNode, options?: RenderOptions): string {
       return `<div class="an-table-wrap"><table class="an-table">${caption}${head}${body}</table></div>`;
     }
     case "h1":
-      return `<h1>${renderText(block)}</h1>`;
+      return `<h1>${renderText(block, options)}</h1>`;
     case "h2":
-      return `<h2>${renderText(block)}</h2>`;
+      return `<h2>${renderText(block, options)}</h2>`;
     case "h3":
-      return `<h3>${renderText(block)}</h3>`;
+      return `<h3>${renderText(block, options)}</h3>`;
     case "p":
-      return `<p>${renderText(block)}</p>`;
+      return `<p>${renderText(block, options)}</p>`;
     case "quote":
-      return `<blockquote>${renderText(block)}</blockquote>`;
+      return `<blockquote>${renderText(block, options)}</blockquote>`;
     case "code":
       return `<pre><code${block.language ? ` data-language="${escapeHtml(block.language)}"` : ""}>${escapeHtml(block.text ?? "")}</code></pre>`;
     case "link": {
-      const href = safeSrc(block.href) ?? "#";
-      return `<p><a href="${escapeHtml(href)}"${arknetzLinkAttrs(href)} rel="noopener">${renderText(block) || escapeHtml(block.href ?? "")}</a></p>`;
+      const href = outHref(safeSrc(block.href), options);
+      return `<p><a href="${escapeHtml(href)}"${arknetzLinkAttrs(href)} rel="noopener">${renderText(block, options) || escapeHtml(block.href ?? "")}</a></p>`;
     }
     case "hero":
       return `<section class="an-hero"><h1>${escapeHtml(block.title ?? block.text ?? "")}</h1>${block.subtitle ? `<p class="an-subtitle">${escapeHtml(block.subtitle)}</p>` : ""}</section>`;
     case "nav": {
       const items = (block.items ?? [])
         .map((i) => {
-          const href = safeSrc(i.href) ?? "#";
+          const href = outHref(safeSrc(i.href), options);
           return `<a href="${escapeHtml(href)}"${arknetzLinkAttrs(href)}>${escapeHtml(i.text ?? "")}</a>`;
         })
         .join("");
@@ -267,7 +284,7 @@ function renderBlockInner(block: BlockNode, options?: RenderOptions): string {
     case "docs-sidebar": {
       const items = (block.items ?? [])
         .map((i) => {
-          const href = safeSrc(i.href) ?? "#";
+          const href = outHref(safeSrc(i.href), options);
           return `<li><a href="${escapeHtml(href)}"${arknetzLinkAttrs(href)}>${escapeHtml(i.text ?? "")}</a></li>`;
         })
         .join("");
@@ -329,7 +346,7 @@ export const READER_CSS = `
 .an-gallery figure{margin:0}
 .an-docs-sidebar{border-right:1px solid #e5e7eb;padding-right:1rem}
 .an-docs-sidebar ul{list-style:none;padding:0;margin:0}
-@media (max-width:480px){.an-hide-mobile{display:none}.an-site h1{font-size:1.6rem}}
+@media (max-width:480px){.an-hide-mobile{display:none}.an-site h1{font-size:1.6rem}.an-site pre code{white-space:pre-wrap;overflow-wrap:break-word}}
 @media (min-width:481px) and (max-width:900px){.an-hide-tablet{display:none}}
 @media (min-width:901px){.an-hide-desktop{display:none}}
 blockquote{border-left:3px solid var(--an-accent);margin:1rem 0;padding-left:1rem;color:var(--an-muted)}
@@ -351,7 +368,7 @@ export function renderSiteDocument(site: SiteDocument, options?: RenderOptions):
   const footer = (site.footer ?? []).map((b) => renderBlock(b, options)).join("\n");
   const nav = (site.nav ?? [])
     .map((n) => {
-      const href = isSafeUrl(n.href) ? n.href : "#";
+      const href = outHref(isSafeUrl(n.href) ? n.href : null, options);
       return `<a href="${escapeHtml(href)}"${arknetzLinkAttrs(href)}>${escapeHtml(n.label)}</a>`;
     })
     .join("");

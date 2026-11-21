@@ -145,6 +145,55 @@ test("static export: index + style + one page per nav entry, rendered by the sha
   assert.match(index, /archive\.org|style\.css/);
 });
 
+// Hunt 4: an exported site's links must be relative — arknetz:// hrefs
+// are dead in a normal browser, so the old export's nav did nothing.
+test("static export: same-domain nav links are relative, cross-domain links stay", () => {
+  const doc: SiteDocument = {
+    domain: "blog.zine",
+    title: "Blog",
+    nav: [
+      { label: "Home", href: "arknetz://blog.zine" },
+      { label: "About", href: "arknetz://blog.zine/about" },
+      { label: "Elsewhere", href: "arknetz://other.zine/page" },
+    ],
+    blocks: [{ type: "p", text: "Hi" }],
+  };
+  const files = exportStaticFiles(doc);
+  const index = files.find((f) => f.path === "index.html")!.content as string;
+  assert.match(index, /href="about\/"/, "index links to the about page relatively");
+  assert.match(index, /href="\.\/"/, "index links home relatively");
+  assert.match(index, /href="arknetz:\/\/other\.zine\/page"/, "cross-domain links stay app links");
+  assert.doesNotMatch(index, /href="arknetz:\/\/blog\.zine/, "no same-domain arknetz:// hrefs survive on the index");
+  const about = files.find((f) => f.path === "about/index.html")!.content as string;
+  assert.match(about, /href="\.\.\/"/, "about links home relatively");
+  assert.match(about, /href="\.\.\/about\/"/, "about links to itself relatively");
+  assert.match(about, /href="\.\.\/favicon\.svg"/, "about favicon is relative");
+  assert.match(about, /href="\.\.\/style\.css"/, "about stylesheet is relative");
+  assert.match(index, /href="favicon\.svg"/, "index favicon is relative");
+  assert.match(index, /href="style\.css"/, "index stylesheet is relative");
+});
+
+test("static export: a sub-page from doc.pages renders its real content", () => {
+  const doc: SiteDocument = {
+    domain: "blog.zine",
+    title: "Blog",
+    nav: [{ label: "About", href: "arknetz://blog.zine/about" }],
+    blocks: [{ type: "p", text: "Home" }],
+    pages: {
+      about: {
+        domain: "blog.zine",
+        title: "About",
+        nav: [{ label: "Home", href: "arknetz://blog.zine" }],
+        blocks: [{ type: "p", text: "About this blog, for real." }],
+      },
+    },
+  };
+  const files = exportStaticFiles(doc);
+  const about = files.find((f) => f.path === "about/index.html")!.content as string;
+  assert.match(about, /About this blog, for real\./);
+  assert.doesNotMatch(about, /<h1>About<\/h1>\s*<\/main>/, "no heading-only stub when the site carries the page");
+});
+
 // Regression tests for the three Lighthouse audits the export controls
 // (round 3 QA, 2026-11-20): missing <main> landmark, missing meta
 // description, and the /favicon.ico 404 console error.
@@ -167,7 +216,7 @@ test("static export: main landmark, meta description, and a real favicon", () =>
   assert.match(index, /<main>/, "page body must be inside a <main> landmark");
   assert.match(index, /<\/main>/);
   assert.match(index, /<meta name="description" content="Notes from the edge of the web\."/);
-  assert.match(index, /<link rel="icon" type="image\/svg\+xml" href="\/favicon\.svg">/);
+  assert.match(index, /<link rel="icon" type="image\/svg\+xml" href="favicon\.svg">/);
   // Description is derived, escaped, and capped at 160 chars.
   const long = exportStaticFiles({
     domain: "x.zine",

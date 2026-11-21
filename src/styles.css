@@ -19,7 +19,18 @@ body:focus{outline:none}
    never inside the header. Hidden until there is a message. */
 .an-signin-status{padding:.5rem 1rem;background:#fef3c7;color:#92400e;font-size:.9rem;overflow-wrap:break-word}
 button{cursor:pointer;border:1px solid #d1d5db;background:#fff;border-radius:6px;padding:.35rem .7rem}
-button:disabled{opacity:.45;cursor:default}
+/* Hunt 4 L3: a disabled button was pale grey on near-white (opacity
+   .45) — faint at a glance. Disabled now reads as greyed, not gone:
+   solid mid-grey text on a light-grey face. */
+button:disabled{color:#4b5563;background:#f3f4f6;opacity:1;cursor:default}
+/* Hunt 4 M2: 44px minimum touch targets on interactive controls —
+   every button measured 28px tall, block ↑/↓ buttons 23×22px. */
+.an-topbar button,.an-tabbar button,.an-toolbar button,.an-panel-btn,
+.an-panel-host button,.an-editor-bar button,.an-editor-bar select,
+.an-fmt-bar button,.an-ed-bar button,.an-slash-row button,
+.an-slash-row select,.an-settings-row button,.an-ed-field{min-height:44px}
+.an-ed-bar button{min-width:44px}
+.an-fmt-bar button{min-width:44px}
 .an-tabbar{display:flex;gap:.25rem;padding:.25rem .5rem;background:#f3f4f6;border-bottom:1px solid #e5e7eb;overflow-x:auto}
 .an-tab{padding:.3rem .7rem;border:1px solid #d1d5db;border-bottom:none;border-radius:6px 6px 0 0;background:#fff;white-space:nowrap}
 .an-tab[aria-selected="true"]{background:#2563eb;color:#fff;border-color:#2563eb}
@@ -56,6 +67,27 @@ pre.an-ed-text{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px
   .an-layout .an-editor{grid-column:1;grid-row:auto}
   .an-topbar{padding:.5rem}
   .an-toolbar button{padding:.35rem .5rem}
+  /* Hunt 4 M1: an editable code block wraps on narrow screens, like
+     the reader's pre (same rule in READER_CSS) — long lines never
+     hide off the right edge with no cue. */
+  pre.an-ed-text{white-space:pre-wrap;overflow-wrap:break-word}
+}
+/* Hunt 4 M3: at 360px the topbar wrapped to two rows (80px tall) and
+   ate ~10% of the viewport. Under 400px the bar stays one row: the
+   brand truncates with an ellipsis instead of pushing Sign in down. */
+@media (max-width:400px){
+  .an-topbar{flex-wrap:nowrap;padding:.4rem .5rem;gap:.4rem}
+  /* The base .an-brand has flex-shrink:0 — without flex-shrink:1 here
+     the brand never truncates and the Guest pill gets squeezed to
+     "Gu…". The brand truncates first; the pill keeps its full word. */
+  .an-brand{font-size:.85rem;min-width:0;flex-shrink:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .an-account{gap:.4rem;flex-wrap:nowrap}
+  #signin-btn{padding:.35rem .4rem;font-size:.8rem;white-space:nowrap}
+  /* Hunt 4 recheck: at 360px the Guest pill wrapped MID-WORD
+     ("Gues / t") — white-space:normal from the L9 fix lets it break
+     anywhere when the bar is narrow. Under 400px the pill stays one
+     line and truncates with an ellipsis instead. */
+  #account-pill{padding:.35rem .5rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 }
 
 /* --- Panels (B2): full-width strip under the toolbar, not the sidebar. --- */
@@ -73,6 +105,9 @@ pre.an-ed-text{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px
 .an-panel-host input[type="checkbox"]{width:auto}
 .an-panel-host label.an-terms-label{display:flex;gap:.4rem;align-items:flex-start}
 .an-panel-host label.an-terms-label input[type="checkbox"]{flex-shrink:0;margin-top:.15rem}
+/* Hunt 4 L1: the Terms checkbox was 13×13px — a third of a fingertip.
+   Checkboxes are 20px now (the label text stays tappable too). */
+.an-panel-host input[type="checkbox"],.an-editor-sidebar input[type="checkbox"]{width:20px;height:20px;accent-color:#2563eb}
 .an-panel-host button{margin:4px 4px 4px 0;padding:4px 10px;cursor:pointer}
 
 /* --- IA settings form (B10): labels above inputs, full width, so a

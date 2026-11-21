@@ -7,6 +7,7 @@
 // Pure renderers live in renderPanelHtml() so tests can exercise them
 // without a DOM; mountPanels() adds the nav + button wiring.
 import { APP_PANELS, visiblePanelsForLogin, type ArkNetzApp } from "./app.js";
+import { scrollBelowTopbar } from "./scroll.js";
 import { MASTER_GITHUB_USER } from "./config.js";
 import { ADMIN_COPY, buildAdminPanelViewModel } from "./moderation-ui.js";
 import { availabilityMessage, CLAIM_COPY, claimSteps } from "./domains-ui.js";
@@ -47,6 +48,12 @@ export interface PanelHostOptions {
    *  decide whether the Moderation nav button is shown (P5: hidden
    *  unless the active account is the Root Master). Defaults to guest. */
   getGithubLogin?: () => string | null | undefined;
+  /** Called synchronously on every panel switch, after the reader /
+   *  editor toggle: the shell uses it to hide the main layout (reader
+   *  + sidebar + editor) while a non-browse, non-builder panel is
+   *  active (hunt 4 M4 — panels used to stack above the full reader,
+   *  so every panel read as one endless page). */
+  onPanelShown?: (panelId: string) => void;
   fetchFn?: typeof fetch;
   /** Default: anchor-click download. Overridable in tests. */
   download?: (blob: Blob, filename: string) => void;
@@ -314,7 +321,7 @@ export async function renderPanelHtml(
       return (
         h +
         note("Snapshots come from the Wayback Machine's free CDX API; if a site's primary repo is deleted or unreachable, the client falls back to the latest preserved snapshot.") +
-        `<label>Public URL to look up <input id="an-wayback-url" type="text" placeholder="https://raw.githubusercontent.com/you/repo/main/site.json.zst"></label>
+        `<label>Public URL to look up <input id="an-wayback-url" type="text" placeholder="https://…/site.json.zst"></label>
          <button id="an-wayback-btn" type="button">Look up snapshots</button>
          <button id="an-wayback-save-btn" type="button">Snapshot now (Save Page Now)</button>
          <div id="an-wayback-results" role="status"></div>`
@@ -601,7 +608,7 @@ export function mountPanels(
 ): { showPanel: (panelId: string) => void; state: PanelState; refreshNav: () => void } {
   const state = createPanelState();
   let active = "browse";
-  const showPanel = (panelId: string): void => {
+  const showPanel = (panelId: string, scroll = true): void => {
     active = panelId;
     for (const btn of nav.querySelectorAll<HTMLButtonElement>("button[data-panel]")) {
       btn.setAttribute("aria-selected", String(btn.dataset.panel === panelId));
@@ -609,7 +616,14 @@ export function mountPanels(
     // M3: switching to a panel scrolls the panel host into view — a
     // panel clicked from the bottom of the page used to render above
     // the fold, with the viewport still showing the reader/editor.
-    host.scrollIntoView({ block: "start" });
+    // Hunt 4: below the STICKY topbar, not under it — plain
+    // scrollIntoView({block:"start"}) hid the panel heading behind
+    // the bar on every switch.
+    // Hunt 4 regression watch: the MOUNT call must not scroll at all —
+    // a fresh load should land at scrollY 0 (toolbar first), not
+    // yanked to the panel host. showPanel(active, false) below.
+    if (scroll) scrollBelowTopbar(host);
+    opts.onPanelShown?.(panelId);
     void renderPanelHtml(app, panelId, state, opts).then((html) => {
       host.innerHTML = html;
       wirePanel(host, app, panelId, state, opts, () => showPanel(active));
@@ -644,7 +658,7 @@ export function mountPanels(
     else showPanel(active);
   };
   buildNav();
-  showPanel(active);
+  showPanel(active, false);
   return { showPanel, state, refreshNav };
 }
 

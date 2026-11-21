@@ -19,7 +19,16 @@ export interface ExportFile {
 
 /** All files of the static export. index.html is the document rendered
  *  by the SHARED renderer — the export is exactly what the reader
- *  shows, not a second rendering. */
+ *  shows, not a second rendering. Hunt 4: every link an exported page
+ *  emits is RELATIVE. The old export kept arknetz:// hrefs, which are
+ *  dead in a normal browser (Chrome waits on the unknown scheme and
+ *  nothing happens), so an exported site was only navigable by typing
+ *  URLs or from inside the app. Same-domain arknetz:// links are
+ *  rewritten per page depth (index.html -> "about/", about/index.html
+ *  -> "../"); cross-domain arknetz:// links stay as-is — they are app
+ *  links to another site, not pages of this export. Asset links
+ *  (style.css, favicon.svg) are relative for the same reason, so the
+ *  export also works hosted under a sub-path. */
 export function exportStaticFiles(doc: SiteDocument): ExportFile[] {
   const files: ExportFile[] = [];
   const css = `:root{--an-accent:${doc.theme?.accent ?? "#2563eb"};--an-font:${doc.theme?.font ?? "system-ui, sans-serif"}}\n${READER_CSS}`;
@@ -27,16 +36,37 @@ export function exportStaticFiles(doc: SiteDocument): ExportFile[] {
   // A real favicon file: without one every browser requests /favicon.ico
   // and logs a 404 console error (Lighthouse best-practices audit).
   files.push({ path: "favicon.svg", content: FAVICON_SVG });
-  const page = (title: string, bodyHtml: string, description: string) =>
-    `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<meta name="description" content="${escapeXml(description)}">\n<link rel="icon" type="image/svg+xml" href="/favicon.svg">\n<title>${escapeXml(title)}</title>\n<link rel="stylesheet" href="/style.css">\n</head>\n<body>\n<main>\n${bodyHtml}\n</main>\n</body>\n</html>\n`;
-  files.push({ path: "index.html", content: page(doc.title, renderSiteDocument(doc), docDescription(doc)) });
+  /** Rewrite same-domain arknetz:// links to relative URLs for a page
+   *  at `pagePath` (depth = directory levels below the export root). */
+  const rewriteHrefFor = (pagePath: string): ((href: string) => string) => {
+    const depth = pagePath.split("/").length - 1;
+    const up = "../".repeat(depth);
+    return (href: string): string => {
+      if (!href.startsWith("arknetz://")) return href;
+      const rest = href.slice("arknetz://".length);
+      const host = rest.split("/")[0] ?? "";
+      if (host !== doc.domain) return href;
+      const slug = rest.slice(host.length).replace(/^\/+/, "").replace(/\/+$/, "");
+      if (!slug) return depth === 0 ? "./" : up;
+      return depth === 0 ? `${slug}/` : `${up}${slug}/`;
+    };
+  };
+  const page = (pagePath: string, title: string, bodyHtml: string, description: string) => {
+    const depth = pagePath.split("/").length - 1;
+    const prefix = "../".repeat(depth);
+    return `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<meta name="description" content="${escapeXml(description)}">\n<link rel="icon" type="image/svg+xml" href="${prefix}favicon.svg">\n<title>${escapeXml(title)}</title>\n<link rel="stylesheet" href="${prefix}style.css">\n</head>\n<body>\n<main>\n${bodyHtml}\n</main>\n</body>\n</html>\n`;
+  };
+  files.push({ path: "index.html", content: page("index.html", doc.title, renderSiteDocument(doc, { rewriteHref: rewriteHrefFor("index.html") }), docDescription(doc)) });
   // One static page per extra nav entry (about, blog, …). Each reuses
   // the same header/footer/nav, so the export is a real multi-page site.
+  // The page body comes from the site's own sub-page (doc.pages) when
+  // it carries one — the same content the reader shows — and only
+  // falls back to the old heading-only stub for sites that have none.
   for (const entry of doc.nav ?? []) {
     const slug = entry.href.replace(/^arknetz:\/\/[^/]+\/?/, "").replace(/\/$/, "");
     if (!slug || slug === "index") continue;
-    const sub: SiteDocument = { ...doc, title: entry.label, blocks: [{ type: "h1", text: entry.label }] };
-    files.push({ path: `${slug}/index.html`, content: page(entry.label, renderSiteDocument(sub), entry.label) });
+    const sub: SiteDocument = doc.pages?.[slug] ?? { ...doc, title: entry.label, blocks: [{ type: "h1", text: entry.label }] };
+    files.push({ path: `${slug}/index.html`, content: page(`${slug}/index.html`, sub.title, renderSiteDocument(sub, { rewriteHref: rewriteHrefFor(`${slug}/index.html`) }), docDescription(sub)) });
   }
   return files;
 }

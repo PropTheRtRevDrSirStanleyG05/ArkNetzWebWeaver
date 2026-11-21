@@ -174,6 +174,163 @@ export async function completeOAuthCallback(
   return { token, user };
 }
 
+// --- GitHub device authorization flow (hunt 4, BUG 1) --------------------
+// Why this exists: the redirect flow (above) can never complete on a
+// phone. Its code exchange needs the OAuth App's client secret, and the
+// secret is read from the ARKNETZ_GITHUB_OAUTH_CLIENT_SECRET environment
+// variable — which cannot exist inside a released APK (or any app a
+// user installs). The redirect itself is also broken as shipped: with
+// no opener plugin, window.open keeps GitHub inside the app's WebView,
+// where the Rust nav guard blocks the arknetz:// callback, so the app
+// never sees the code at all. The device flow needs NEITHER: only the
+// client id (already in config.ts), no secret, no redirect URI, no
+// deep link. The user types a short code at github.com/device in their
+// own browser; the app polls until GitHub issues the token.
+//   POST https://github.com/login/device/code
+//     {client_id, scope} -> {device_code, user_code, verification_uri,
+//       expires_in, interval}
+//   POST https://github.com/login/oauth/access_token
+//     {client_id, device_code, grant_type:
+//      "urn:ietf:params:oauth:grant-type:device_code"}
+//     -> {access_token} | {error: "authorization_pending"|"slow_down"|
+//       "expired_token"|"access_denied"|"device_flow_disabled"}
+// One prerequisite lives OUTSIDE this repo: Device Flow must be
+// enabled on the OAuth App itself (GitHub Settings -> Developer
+// settings -> OAuth Apps -> ArkNetzWebWeaver -> "Enable Device Flow").
+// Until that checkbox is on, GitHub answers device_flow_disabled —
+// the request below surfaces that as an exact, actionable error
+// instead of a silent failure. Do NOT change OAuth App settings from
+// here; the app owner flips the checkbox.
+
+export const GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code";
+export const DEVICE_FLOW_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
+
+export interface DeviceCodeResponse {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  /** Seconds until the code expires (GitHub default 900). */
+  expiresIn: number;
+  /** Seconds between polls (GitHub default 5). */
+  interval: number;
+}
+
+/** Ask GitHub for a device code. `fetchFn` is injectable so tests
+ *  never hit real GitHub; production passes the global fetch. Throws
+ *  loudly on device_flow_disabled with the exact fix (enable Device
+ *  Flow on the OAuth App). */
+export async function requestDeviceCode(
+  clientId = GITHUB_OAUTH_CLIENT_ID,
+  fetchFn: typeof fetch = globalThis.fetch,
+): Promise<DeviceCodeResponse> {
+  const res = await fetchFn(GITHUB_DEVICE_CODE_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": USER_AGENT,
+    },
+    body: new URLSearchParams({
+      client_id: clientId,
+      scope: GITHUB_OAUTH_SCOPES.join(" "),
+    }).toString(),
+  });
+  const body = (await res.json()) as Record<string, unknown>;
+  if (typeof body.error === "string") {
+    if (body.error === "device_flow_disabled") {
+      throw new Error(
+        "GitHub sign-in failed: Device Flow is not enabled on this OAuth App. " +
+          "Enable it in the OAuth App settings (GitHub Settings → Developer settings → OAuth Apps → ArkNetzWebWeaver → Enable Device Flow), then try again.",
+      );
+    }
+    throw new Error(`GitHub device-code request failed: ${body.error}`);
+  }
+  const deviceCode = body.device_code;
+  const userCode = body.user_code;
+  const verificationUri = body.verification_uri;
+  if (typeof deviceCode !== "string" || !deviceCode || typeof userCode !== "string" || !userCode || typeof verificationUri !== "string" || !verificationUri) {
+    throw new Error("GitHub device-code request returned no code — sign-in cannot start");
+  }
+  return {
+    deviceCode,
+    userCode,
+    verificationUri,
+    expiresIn: typeof body.expires_in === "number" ? body.expires_in : 900,
+    interval: typeof body.interval === "number" ? body.interval : 5,
+  };
+}
+
+/** Poll GitHub until the user authorizes (or denies / the code
+ *  expires). Sleeps `interval` seconds between attempts; honors
+ *  slow_down by adding 5 s; stops at `deadlineMs` (the code's
+ *  expiry). `sleepFn` is injectable so tests run instantly. Returns
+ *  the access token; never invents one. */
+export async function pollDeviceToken(
+  deviceCode: string,
+  opts: {
+    clientId?: string;
+    intervalSec?: number;
+    deadlineMs?: number;
+    fetchFn?: typeof fetch;
+    sleepFn?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<string> {
+  const clientId = opts.clientId ?? GITHUB_OAUTH_CLIENT_ID;
+  const fetchFn = opts.fetchFn ?? globalThis.fetch;
+  const sleepFn = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let intervalMs = (opts.intervalSec ?? 5) * 1000;
+  const deadlineMs = opts.deadlineMs ?? Date.now() + 900_000;
+  for (;;) {
+    const res = await fetchFn(GITHUB_TOKEN_URL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+      },
+      body: new URLSearchParams({
+        client_id: clientId,
+        device_code: deviceCode,
+        grant_type: DEVICE_FLOW_GRANT_TYPE,
+      }).toString(),
+    });
+    const body = (await res.json()) as Record<string, unknown>;
+    if (typeof body.access_token === "string" && body.access_token) {
+      return body.access_token;
+    }
+    const error = typeof body.error === "string" ? body.error : "";
+    if (error === "authorization_pending") {
+      // Not yet — wait and poll again.
+    } else if (error === "slow_down") {
+      intervalMs += 5000;
+    } else if (error === "expired_token") {
+      throw new Error("GitHub sign-in failed: the device code expired — start sign-in again for a fresh code.");
+    } else if (error === "access_denied") {
+      throw new Error("GitHub sign-in failed: the authorization was denied on github.com/device.");
+    } else if (error) {
+      throw new Error(`GitHub device sign-in failed: ${error}`);
+    } else {
+      throw new Error("GitHub device sign-in returned neither a token nor an error");
+    }
+    if (Date.now() + intervalMs > deadlineMs) {
+      throw new Error("GitHub sign-in failed: the device code expired — start sign-in again for a fresh code.");
+    }
+    await sleepFn(intervalMs);
+  }
+}
+
+/** The full device-flow completion: fetch the token owner's login for
+ *  a token obtained by pollDeviceToken. Same shape as
+ *  completeOAuthCallback's tail, so the shell finishes both flows the
+ *  same way (keyring, pill, panels). */
+export async function completeDeviceSignIn(
+  token: string,
+  deps: OAuthCompletionDeps = {},
+): Promise<{ token: string; user: GithubUser }> {
+  const user = await (deps.fetchUser ?? fetchGithubUser)(token);
+  return { token, user };
+}
+
 // --- Pending state across processes ---------------------------------------
 // The OS may deliver the callback to a SECOND app process (no
 // single-instance plugin yet — see deep-link.ts): that process shares

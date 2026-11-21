@@ -124,6 +124,15 @@ export interface SiteDocument {
   header?: BlockNode[];
   footer?: BlockNode[];
   blocks: BlockNode[];
+  /** Sub-pages, keyed by path slug ("about" for
+   *  arknetz://domain/about). A nav entry points at a sub-page; the
+   *  reader renders pages[slug] when it exists and falls back to the
+   *  root document when it does not. The static export emits one file
+   *  per nav entry from the same map. Absent = a single-page site
+   *  (the pre-0.4.1 shape) — old documents load unchanged. Sub-pages
+   *  are read-only in the editor for now: editing one could publish
+   *  it as the site root, so the Edit toggle is disabled on them. */
+  pages?: Record<string, SiteDocument>;
   version?: string;
   updated?: number;
 }

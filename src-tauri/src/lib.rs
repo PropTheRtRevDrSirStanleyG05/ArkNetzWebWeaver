@@ -126,6 +126,12 @@ async fn github_oauth_exchange(code: String, client_id: String) -> ExchangeResul
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
+        // Hunt 4 (BUG 1): without the opener plugin, window.open kept
+        // GitHub inside the app's WebView and the OAuth redirect could
+        // never come back. The opener sends URLs to the system browser
+        // (Chrome on Android, default browser on desktop) — the only
+        // place a redirect to arknetz:// can be delivered by the OS.
+        .plugin(tauri_plugin_opener::init())
         .plugin(arknetz_nav_guard_plugin())
         .setup(|_app| {
             // Debug builds only: register the arknetz:// scheme for the

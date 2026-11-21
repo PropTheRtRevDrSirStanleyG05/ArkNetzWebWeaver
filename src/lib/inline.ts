@@ -213,7 +213,7 @@ export function clearLink(runs: InlineRun[], start: number, end: number): Inline
  *  (an unsafe href renders as plain text, never as a link); marks nest in
  *  a fixed order so the output is deterministic: a > code > strong > em >
  *  u > s, innermost text last. */
-export function renderInlineRuns(runs: InlineRun[]): string {
+export function renderInlineRuns(runs: InlineRun[], rewriteHref?: (href: string) => string): string {
   return runs
     .map((run) => {
       const f = run.format;
@@ -225,7 +225,8 @@ export function renderInlineRuns(runs: InlineRun[]): string {
       if (f.bold) inner = `<strong>${inner}</strong>`;
       if (f.code) inner = `<code>${inner}</code>`;
       if (f.href && isSafeUrl(f.href)) {
-        inner = `<a href="${escapeHtml(f.href)}" rel="noopener">${inner}</a>`;
+        const href = rewriteHref ? rewriteHref(f.href) : f.href;
+        inner = `<a href="${escapeHtml(href)}" rel="noopener">${inner}</a>`;
       }
       return inner;
     })

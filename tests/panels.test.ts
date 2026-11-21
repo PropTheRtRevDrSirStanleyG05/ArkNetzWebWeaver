@@ -216,6 +216,9 @@ test("panels: backends renders every backend unlinked with no accessors, linked 
 
 // M3 + M5 (fix pass 2): switching panels scrolls the panel host
 // into view and closes the editor unless the panel IS the builder.
+// Hunt 4: the scroll goes BELOW the sticky topbar (scrollBelowTopbar),
+// not under it — plain scrollIntoView hid the panel heading behind
+// the bar on every switch.
 // mountPanels needs a real DOM (it calls the global document and
 // HTMLElement.scrollIntoView), so the node suite cannot mount it —
 // these assertions pin the wiring in the source, and the headless
@@ -223,9 +226,25 @@ test("panels: backends renders every backend unlinked with no accessors, linked 
 test("panels: showPanel scrolls the host into view; non-builder nav closes the editor", async () => {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../../src/lib/panels.ts", import.meta.url), "utf8");
-  assert.match(src, /host\.scrollIntoView\(\{ block: "start" \}\)/, "M3: showPanel scrolls the panel host into view");
+  assert.match(src, /scrollBelowTopbar\(host\)/, "M3/hunt 4: showPanel scrolls the panel host below the sticky topbar");
+  assert.match(src, /showPanel\(active, false\)/, "hunt 4: the mount call does not scroll — a fresh load lands at scrollY 0, not yanked to the panel host");
   const click = src.slice(src.indexOf('btn.addEventListener("click"'));
   assert.match(click, /if \(panel\.id === "builder"\) opts\.showEditor\(\);\s*\n\s*else opts\.showReader\(\);/, "M5: only Builder keeps the editor open — every other panel shows the reader");
+});
+
+// Hunt 4 mobile CSS: 44px touch targets, one-row topbar under 400px,
+// 20px checkboxes, readable disabled buttons, and code that wraps
+// instead of hiding off the right edge on phones.
+test("hunt 4: shell CSS carries the mobile fixes", async () => {
+  const { readFileSync } = await import("node:fs");
+  const css = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
+  assert.match(css, /\.an-topbar button,\.an-tabbar button,\.an-toolbar button,\.an-panel-btn,[\s\S]*?min-height:44px/, "M2: 44px minimum touch targets");
+  assert.match(css, /\.an-ed-bar button\{min-width:44px\}/, "M2: block move buttons are 44px wide");
+  assert.match(css, /@media \(max-width:400px\)\{[\s\S]*?\.an-topbar\{flex-wrap:nowrap/, "M3: topbar stays one row under 400px");
+  assert.match(css, /@media \(max-width:400px\)\{[\s\S]*?#account-pill\{[^}]*white-space:nowrap;overflow:hidden;text-overflow:ellipsis/, "hunt 4 recheck: Guest pill never wraps mid-word at 360px");
+  assert.match(css, /\.an-panel-host input\[type="checkbox"\],\.an-editor-sidebar input\[type="checkbox"\]\{width:20px;height:20px/, "L1: 20px checkboxes");
+  assert.match(css, /button:disabled\{color:#4b5563;background:#f3f4f6;opacity:1/, "L3: disabled buttons stay readable");
+  assert.match(css, /pre\.an-ed-text\{white-space:pre-wrap;overflow-wrap:break-word\}/, "M1: editable code wraps on narrow screens");
 });
 
 // L6 (fix pass 2): panel checkboxes never take the full-width input

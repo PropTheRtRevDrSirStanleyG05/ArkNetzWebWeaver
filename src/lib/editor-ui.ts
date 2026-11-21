@@ -55,6 +55,7 @@ import { importWxr } from "./wxr.js";
 import { importHtml, importHtmlFromUrl } from "./html-import.js";
 import type { HtmlFetchFn, HtmlImportResult } from "./html-import.js";
 import { describePeerCursors } from "./collab/cursors.js";
+import { isTopHiddenBelowTopbar, scrollBelowTopbar } from "./scroll.js";
 import { describeConflict } from "./collab/types.js";
 import { buildSiteOpenedViewModel } from "./domains-ui.js";
 import type { OpenedSite } from "./domains.js";
@@ -1230,6 +1231,17 @@ export class EditorUI {
       // the sidebar).
       this.updateBlockSelection();
       this.renderSidebar();
+      // Hunt 4 M5: tapping a block whose format toolbar sits below the
+      // fold leaves the user with text and no visible controls. Scroll
+      // the block's toolbar into view below the topbar — but ONLY when
+      // it is actually hidden, so a click that lands in view never
+      // moves the page under the user's finger (or mouse).
+      // querySelectorAll (not querySelector): the node test fake DOM
+      // only implements querySelectorAll, and the scroll helper no-ops
+      // there anyway (no getBoundingClientRect / window).
+      const fmtBar = wrap.querySelectorAll(".an-fmt-bar")[0] as HTMLElement | undefined;
+      const target = fmtBar ?? wrap;
+      if (isTopHiddenBelowTopbar(target)) scrollBelowTopbar(target);
     });
     wrap.addEventListener("dragstart", (e) => {
       this.draggedId = block.id ?? null;

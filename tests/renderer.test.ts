@@ -2,6 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { escapeHtml, installArknetzLinkInterceptor, isArknetzUrl, isSafeUrl, READER_CSS, renderBlock, renderSiteDocument } from "../src/lib/renderer.js";
+import type { SiteDocument } from "../src/lib/types.js";
 import type { ArknetzLinkRoot } from "../src/lib/renderer.js";
 
 test("escapeHtml neutralises script injection", () => {
@@ -204,4 +205,49 @@ test("renderer: READER_CSS keeps pre blocks inside the reader width", () => {
 test("renderer: READER_CSS scales the H1 down below 480px and gives headings break-word", () => {
   assert.match(READER_CSS, /\.an-site h1,\.an-site h2,\.an-site h3\{overflow-wrap:break-word\}/);
   assert.match(READER_CSS, /@media \(max-width:480px\)\{[\s\S]*?\.an-site h1\{font-size:1\.6rem\}/);
+});
+
+// Hunt 4: rewriteHref — the export's relative-link hook. In-app
+// rendering passes no rewriter, so arknetz:// hrefs and their marker
+// stay exactly as before.
+test("renderer: rewriteHref rewrites doc nav + blocks, and drops the marker on rewritten links", () => {
+  const doc: SiteDocument = {
+    domain: "blog.zine",
+    title: "Blog",
+    nav: [
+      { label: "Home", href: "arknetz://blog.zine" },
+      { label: "About", href: "arknetz://blog.zine/about" },
+    ],
+    blocks: [
+      { type: "link", text: "About", href: "arknetz://blog.zine/about" },
+      { type: "nav", items: [{ type: "link", text: "About", href: "arknetz://blog.zine/about" }] },
+    ],
+  };
+  const html = renderSiteDocument(doc, { rewriteHref: (h) => h.replace("arknetz://blog.zine/about", "about/").replace("arknetz://blog.zine", "./") });
+  assert.match(html, /href="about\/"/);
+  assert.match(html, /href="\.\/"/);
+  assert.doesNotMatch(html, /arknetz:\/\//);
+  assert.doesNotMatch(html, /data-arknetz-link/);
+  const plain = renderSiteDocument(doc);
+  assert.match(plain, /href="arknetz:\/\/blog\.zine\/about"/);
+  assert.match(plain, /data-arknetz-link="true"/);
+});
+
+test("renderer: rewriteHref applies to inline-run links too", () => {
+  const html = renderBlock(
+    {
+      type: "p",
+      text: "see about",
+      runs: [{ text: "about", format: { href: "arknetz://blog.zine/about" } }],
+    },
+    { rewriteHref: (h) => (h === "arknetz://blog.zine/about" ? "about/" : h) },
+  );
+  assert.match(html, /href="about\/"/);
+  assert.doesNotMatch(html, /arknetz:\/\//);
+});
+
+// Hunt 4 M1: code wraps on narrow screens instead of hiding off the
+// right edge with no scroll cue.
+test("renderer: READER_CSS wraps code on narrow screens instead of clipping it", () => {
+  assert.match(READER_CSS, /@media \(max-width:480px\)\{[\s\S]*?\.an-site pre code\{white-space:pre-wrap;overflow-wrap:break-word\}/);
 });
