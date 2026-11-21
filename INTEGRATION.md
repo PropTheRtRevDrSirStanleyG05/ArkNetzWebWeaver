@@ -2423,6 +2423,8 @@ live REGISTER round-trip
   the parallel agents' in-progress files had type errors (tsc still
   emits JS; manual `npx tsc` → `copy-assets` → `node --test` was the
   working battery route).
-- **Push:** client repo re-push + protocol-repo README/PROTOCOL.md
-  re-push via the connector (see sync records); live head commits
-  recorded in the final report. No release created; keystore untouched.
+- **Push:** client repo re-push DONE — live head
+  `cb0ff1d777c7a62bb775c0be1754b4b4627b83c6` (8 files, all byte-verified
+  live); protocol-repo README + PROTOCOL.md re-push DONE — live head
+  `985d2098606ef49e32af7087a7dcda8a6f237d43` (2 files, byte-verified).
+  No release created; keystore untouched.
