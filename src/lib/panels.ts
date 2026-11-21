@@ -8,7 +8,6 @@
 // without a DOM; mountPanels() adds the nav + button wiring.
 import { APP_PANELS, visiblePanelsForLogin, type ArkNetzApp } from "./app.js";
 import { MASTER_GITHUB_USER } from "./config.js";
-import { isRootMaster } from "./moderation.js";
 import { ADMIN_COPY, buildAdminPanelViewModel } from "./moderation-ui.js";
 import { availabilityMessage, CLAIM_COPY, claimSteps } from "./domains-ui.js";
 import { checkDomainAvailability, normalizeDomain } from "./domains.js";
@@ -69,6 +68,10 @@ export interface PanelHostOptions {
   /** Backends panel: mirror attempts from the last site load.
    *  Defaults to [] (no load through mirrors yet). */
   getLastMirrorAttempts?: () => MirrorAttempt[];
+  /** Accounts panel: start the GitHub OAuth sign-in (the shell's
+   *  startGitHubSignIn). The panel only renders the button; the shell
+   *  owns the flow. Absent in tests — the button then says so. */
+  onSignInWithGitHub?: () => void;
 }
 
 /** Per-mount mutable panel state (keypair, opened vault label + handle). */
@@ -281,14 +284,20 @@ export async function renderPanelHtml(
       );
     }
     case "accounts": {
-      const pill = accountSwitcherPillView(app.keyring.snapshot(), isRootMaster(null));
+      const pill = accountSwitcherPillView(app.keyring.snapshot(), app.keyring.isMasterAdmin());
       const tosStore = createMemoryTosStore();
       const accepted = await hasAccepted(tosStore, "guest");
       const tosVm = tosAcceptanceView(accepted);
+      const activeGithub = app.keyring.getActive("github");
+      const githubStatus = activeGithub
+        ? `Signed in with GitHub as ${activeGithub.username ?? activeGithub.label}${app.keyring.isMasterAdmin() ? " — Root Master" : ""}.`
+        : "Not signed in with GitHub. Publishing, claiming a domain, and sending mail need sign-in.";
       return (
         h +
         section("Accounts", `<p>${esc(pill.pillLabel)} — ${pill.signedInCount} account${pill.signedInCount === 1 ? "" : "s"} signed in. ${pill.masterBadgeVisible ? esc(pill.masterBadgeLabel) : "Root Master controls appear only when the active GitHub account is " + MASTER_GITHUB_USER + "."}</p>
-         <p class="an-note">The keyring ${app.keyring.isUnlocked ? "is unlocked" : "is locked"} — profiles are encrypted in IndexedDB under your passphrase. One-click switching across gh:/gl:/cb:/ia:/hf:/wm: needs linked accounts; none are linked yet.</p>`) +
+         <p class="an-note">The keyring ${app.keyring.isUnlocked ? "is unlocked" : "is locked"} — profiles are encrypted in IndexedDB under your passphrase. One-click switching across gh:/gl:/cb:/ia:/hf:/wm: needs linked accounts; ${pill.signedInCount === 0 ? "none are linked yet." : "switch from the pill in the top bar."}</p>`) +
+        section("GitHub sign-in", `<p>${esc(githubStatus)}</p><p class="an-note">Sign-in runs the real GitHub OAuth flow: the app opens github.com, GitHub sends the app back to arknetz://oauth/callback, and the code is exchanged for a token inside the Tauri shell — the client secret never enters the app. The signed-in account joins the keyring above like any other backend account.</p><button id="an-github-signin-btn" type="button">Sign in with GitHub</button><div id="an-github-signin-status" role="status"></div>`) +
+        section("Keyring", `<p class="an-note">The keyring holds every backend account's token, encrypted under one vault passphrase. It must be unlocked before a signed-in account can be saved — a GitHub sign-in while it is locked works for this session only. ${app.keyring.isUnlocked ? "Unlocked." : "Locked."}</p><label>Vault passphrase <input id="an-keyring-pass" type="password" autocomplete="current-password"></label> <button id="an-keyring-unlock-btn" type="button">Unlock keyring</button> <button id="an-keyring-lock-btn" type="button">Lock keyring</button><div id="an-keyring-status" role="status"></div>`) +
         section("Acceptable Use", `<p>${esc(tosVm.note)}</p><button id="an-tos-accept-btn" type="button">${esc(tosVm.label)}</button><div id="an-tos-status" role="status"></div>`)
       );
     }
@@ -507,6 +516,28 @@ export function wirePanel(
       }).catch((e) => {
         if (status) status.textContent = e instanceof Error ? e.message : String(e);
       });
+    });
+    $("an-keyring-unlock-btn")?.addEventListener("click", () => {
+      const pass = ($("an-keyring-pass") as HTMLInputElement | null)?.value ?? "";
+      const status = $("an-keyring-status");
+      void app.keyring.unlock(pass).then(() => {
+        rerender();
+      }).catch((e) => {
+        if (status) status.textContent = e instanceof Error ? e.message : String(e);
+      });
+    });
+    $("an-keyring-lock-btn")?.addEventListener("click", () => {
+      app.keyring.lock();
+      rerender();
+    });
+    $("an-github-signin-btn")?.addEventListener("click", () => {
+      const status = $("an-github-signin-status");
+      if (status) status.textContent = "Opening GitHub sign-in…";
+      if (opts.onSignInWithGitHub) {
+        opts.onSignInWithGitHub();
+      } else if (status) {
+        status.textContent = "GitHub sign-in is not wired in this shell.";
+      }
     });
   }
   if (panelId === "wayback") {

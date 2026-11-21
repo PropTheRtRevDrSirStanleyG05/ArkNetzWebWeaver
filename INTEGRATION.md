@@ -1528,3 +1528,96 @@ left unmounted. No GitHub work done here. No new dependencies.
   browser (no opener plugin in the Rust shell); it does NOT destroy
   the main UI, which was the bug. If "system browser" is required,
   that needs `tauri-plugin-opener` (MIT/Apache) + a Rust command.
+
+## OAuth callback receiver (2026-11-21, post-push)
+
+The client repo was pushed to GitHub (head fbe1d8f0d93d5bf58ff3cae45905fddfbd840901)
+with the OAuth flow half-built: `buildAuthorizeUrl()` set no
+`redirect_uri`, `handleRedirect()` existed but nothing called it, and
+the deep-link listener routed every `arknetz://` URL to the site
+resolver. All three gaps are now closed, inside the main app — the
+GitHub OAuth is part of the accounts / multi-account sign-in system,
+not a side piece.
+
+### What changed
+
+- `src/lib/config.ts`: `GITHUB_OAUTH_REDIRECT_URI =
+  "arknetz://oauth/callback"` (registered on the OAuth App, client id
+  `Ov23lic8terv0XOd3GDe`, scopes `read:user public_repo`). No secret
+  anywhere in any file — the secret stays runtime env
+  `ARKNETZ_GITHUB_OAUTH_CLIENT_SECRET`, read only by the Rust command.
+- `src/lib/auth.ts`: `buildAuthorizeUrl()` sets `redirect_uri`;
+  `exchangeCode()` now passes `{ code, client_id }` — the Rust
+  command signature is `(code, client_id)` and the old call passed
+  only `{ code }`, which would have failed the invoke. New:
+  `fetchGithubUser()` (GET /user, throws loudly on non-2xx or no
+  login), `completeOAuthCallback()` (handleRedirect -> exchange ->
+  /user, every step throws loudly, injectable mocks for tests), and
+  `savePendingOAuthState()` / `takePendingOAuthState()` — the pending
+  state lives in localStorage, not sessionStorage, because the OS may
+  deliver the callback to a second app process, which shares
+  localStorage but not sessionStorage. It is a one-time CSRF nonce,
+  consumed on use, never leaves the origin.
+- `src/lib/deep-link.ts`: `isOAuthCallbackUrl()` +
+  `handleDeepLinkUrls(urls, openTab, { onOAuthCallback })` intercepts
+  `arknetz://oauth/callback` before the site resolver (the old code
+  silently dropped it: "oauth" is not a valid domain). Both the
+  startup (`getCurrent`) and live (`onOpenUrl`) paths route through
+  it; a throwing handler never breaks the listener.
+- `src/lib/network/accounts.ts`: `addGithubAccount()` adds the
+  signed-in GitHub account to the keyring like any other backend
+  account (encrypted token, active GitHub account, re-sign-in
+  refreshes the token instead of duplicating; throws when locked).
+- `src/lib/panels.ts`: Accounts panel now renders a real "Sign in
+  with GitHub" button (wired to the shell's sign-in via
+  `PanelHostOptions.onSignInWithGitHub`) and a keyring unlock/lock
+  form; the Master badge reads `app.keyring.isMasterAdmin()` instead
+  of the hardcoded `isRootMaster(null)` it used before.
+- `src/main.ts`: `startGitHubSignIn()` (shared by the top-bar button
+  and the Accounts panel), `completeGitHubSignIn()` (state check ->
+  exchange -> /user -> keyring, or a loud exact message when the
+  keyring is locked — session works, account not saved),
+  `refreshGithubStatus()` (Settings status + guest badge, Root Master
+  marker only for the master login), `go()` intercepts a callback URL
+  pasted in the address bar, the app object + `keyring.load()` now
+  happen before the deep-link listener installs (a startup callback
+  needs the keyring), and `panelsRefreshNav` rebuilds the nav after
+  sign-in so Moderation appears for the Root Master.
+- Rust: no change needed. `github_oauth_exchange` already took
+  `(code, client_id)` and reads the secret from the runtime env; the
+  nav guard already blocks top-level `arknetz://` WebView navigation,
+  which is correct for the callback (it arrives via the deep-link
+  plugin, not the WebView).
+
+### Verification
+
+- `npm run check` (tsc): clean.
+- `npm test`: **497 pass, 0 fail** (481 baseline + 16 new:
+  authorize-URL redirect_uri + exact scopes, `completeOAuthCallback`
+  happy path / state mismatch / error param / missing code /
+  exchange failure with mocked exchange, `fetchGithubUser` mocked
+  fetch, `addGithubAccount` keyring integration incl. master badge,
+  token refresh, locked-keyring refusal, callback routing +
+  interception + listener passthrough). No test hits real GitHub.
+- Tauri Linux build: see "Tauri build" below (rebuilt for this change).
+
+### Still NOT verified — needs a real OAuth sign-in (Stanley only)
+
+- The end-to-end live flow (click sign-in -> github.com -> callback
+  -> token -> account in the pill) has never run: it needs the real
+  client secret in `ARKNETZ_GITHUB_OAUTH_CLIENT_SECRET` at runtime,
+  which only Stanley holds. Until that runs, the exchange path is
+  proven only with mocks, and `github_oauth_exchange` will answer
+  `not_configured` — loudly, by design, never a fake token.
+- `window.open(url, "_blank")` in the Tauri WebView opens the GitHub
+  authorize page in a new app window, not necessarily the system
+  browser (pre-existing, see "Still open" above); whether the OS
+  routes `arknetz://oauth/callback` back to the running app or spawns
+  a second process is unproven on an installed build (the
+  localStorage pending-state change covers the second-process case,
+  but no installed .deb launch test has run it).
+- The keyring still uses the memory store in the shipped build
+  (`createArkNetzApp()` with no options), so a GitHub account saved
+  to the keyring lasts the session only — same pre-existing limit as
+  every other account (see "Still open" above). Flipping
+  `useIndexedDB: true` is a wider change needing a deliberate call.

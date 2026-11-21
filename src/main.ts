@@ -18,7 +18,8 @@ import {
   installAppBridgeListener,
 } from "./lib/viewer/app-bridge.js";
 import type { AppBridgeReplyTarget, AppSaveStore } from "./lib/viewer/app-bridge.js";
-import { buildAuthorizeUrl, isMasterUser, randomState } from "./lib/auth.js";
+import { buildAuthorizeUrl, completeOAuthCallback, isMasterUser, randomState, savePendingOAuthState, takePendingOAuthState } from "./lib/auth.js";
+import { addGithubAccount } from "./lib/network/accounts.js";
 import { attachMedia, IaUploadQueue } from "./lib/ia-media.js";
 import type { IaKeys } from "./lib/ia-media.js";
 import {
@@ -43,7 +44,8 @@ import { MASTER_GITHUB_USER } from "./lib/config.js";
 import { EditorUI } from "./lib/editor-ui.js";
 import type { SiteDocument } from "./lib/types.js";
 import { createArkNetzApp } from "./lib/app.js";
-import { installDeepLinkListener } from "./lib/deep-link.js";
+import type { ArkNetzApp } from "./lib/app.js";
+import { installDeepLinkListener, isOAuthCallbackUrl } from "./lib/deep-link.js";
 import { mountPanels } from "./lib/panels.js";
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
@@ -79,6 +81,12 @@ let iaKeys: IaKeys | null = null;
 // command (auth.ts exchangeCode). No token is ever pasted or stored.
 let githubToken: string | null = null;
 let githubLogin: string | null = null;
+/** The app object, once init() has built it — the sign-in completion
+ *  (which can arrive via a deep link at any moment) needs the keyring. */
+let app: ArkNetzApp | null = null;
+/** Rebuild the panel nav after sign-in/out (Moderation appears only
+ *  for the Root Master). Set by mountPanels in init(). */
+let panelsRefreshNav: (() => void) | null = null;
 // The document currently shown in the reader — the editor edits a clone
 // of this, and the reader re-renders from the edited copy on close, so
 // View and Edit always show the same renderer output.
@@ -225,11 +233,100 @@ function updateNavButtons(): void {
 }
 
 async function go(address: string): Promise<void> {
+  // The OAuth callback is not a site address: intercept it before the
+  // tab navigation / site resolver, which would try to load a site
+  // called "oauth" and fail. (Same interception as the deep-link
+  // listener — this covers a callback URL pasted into the address bar.)
+  if (isOAuthCallbackUrl(address)) {
+    await completeGitHubSignIn(address);
+    return;
+  }
   await tabs.navigate(address);
   ($("address-input") as HTMLInputElement).value = address;
   renderTabs();
   await renderCurrent();
   updateNavButtons();
+}
+
+/** Settings sidebar + top bar, from the one source of truth
+ *  (githubToken/githubLogin). The guest badge shows the signed-in
+ *  login — with the Root Master marker only when the login is the
+ *  master user; enforcement stays GitHub's 403, never the UI. */
+function refreshGithubStatus(): void {
+  const ghStatus = $("gh-status");
+  ghStatus.textContent = githubToken
+    ? `GitHub: signed in as ${githubLogin ?? "unknown"} — Publish can run.`
+    : "GitHub: not signed in. Publish needs sign-in (and a GitHub OAuth App must exist first).";
+  ($("guest-badge") as HTMLElement).textContent = githubLogin
+    ? `Signed in as ${githubLogin}${isMasterUser(githubLogin) ? " · Root Master" : ""}`
+    : `Guest · Master: ${MASTER_GITHUB_USER}`;
+}
+
+/** Start the GitHub OAuth sign-in: build the authorize URL (client id
+ *  + redirect_uri + scopes + random state) and open it. The pending
+ *  state is saved to localStorage so the callback can be validated
+ *  even if the OS delivers it to a second app process (see auth.ts).
+ *  Throws loudly, with the exact fix, when no client id is
+ *  configured — never a broken URL, never a fake token. */
+function startGitHubSignIn(): void {
+  const status = $("signin-status");
+  // B8: the status lives in its own strip below the topbar (hidden
+  // until there is a message) — show it when we have something to say.
+  const showStatus = (msg: string): void => {
+    status.textContent = msg;
+    status.hidden = false;
+  };
+  try {
+    const state = randomState();
+    savePendingOAuthState(state);
+    const url = buildAuthorizeUrl(state);
+    showStatus("Opening GitHub sign-in…");
+    window.open(url, "_blank", "noopener");
+  } catch (err) {
+    showStatus(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Finish a GitHub OAuth sign-in from the callback URL the OS handed
+ *  back (arknetz://oauth/callback?code=…&state=…): validate the state,
+ *  exchange the code for a token in the Tauri shell, read the token
+ *  owner's login, and add the account to the multi-account keyring.
+ *  Every failure is shown in the sign-in status strip, loudly and
+ *  exactly — no token is invented, and a half-finished sign-in leaves
+ *  no account behind. When the keyring is locked the session still
+ *  works for this run, but the account is not saved: the strip says
+ *  so and points at the Accounts panel to unlock it. */
+async function completeGitHubSignIn(callbackUrl: string): Promise<void> {
+  const status = $("signin-status");
+  const showStatus = (msg: string): void => {
+    status.textContent = msg;
+    status.hidden = false;
+  };
+  showStatus("GitHub sign-in: completing…");
+  try {
+    const expectedState = takePendingOAuthState();
+    if (!expectedState) {
+      throw new Error(
+        "GitHub sign-in failed: no sign-in was started in this app (no pending state) — click “Sign in with GitHub” and try again.",
+      );
+    }
+    const { token, user } = await completeOAuthCallback(callbackUrl, expectedState);
+    githubToken = token;
+    githubLogin = user.login;
+    if (app?.keyring.isUnlocked) {
+      await addGithubAccount(app.keyring, user, token);
+      showStatus(`Signed in with GitHub as ${user.login} — account saved in the keyring.`);
+    } else {
+      showStatus(`Signed in with GitHub as ${user.login} for this session. The keyring is locked, so the account is not saved yet — unlock the keyring in the Accounts panel to keep it signed in.`);
+    }
+    refreshGithubStatus();
+    panelsRefreshNav?.();
+  } catch (err) {
+    githubToken = null;
+    githubLogin = null;
+    refreshGithubStatus();
+    showStatus(err instanceof Error ? err.message : String(err));
+  }
 }
 
 /** Settings screen: Internet Archive account linking + GitHub status.
@@ -310,10 +407,7 @@ function wireSettings(): void {
     ($("ia-secret-key") as HTMLInputElement).value = "";
     await refreshIaStatus();
   };
-  const ghStatus = $("gh-status");
-  ghStatus.textContent = githubToken
-    ? `GitHub: signed in as ${githubLogin ?? "unknown"} — Publish can run.`
-    : "GitHub: not signed in. Publish needs sign-in (and a GitHub OAuth App must exist first).";
+  refreshGithubStatus();
 }
 
 async function init(): Promise<void> {
@@ -324,14 +418,29 @@ async function init(): Promise<void> {
   updateNavButtons();
   await renderCurrent();
 
+  // The app object first: the deep-link listener below can deliver an
+  // OAuth callback at startup, and completing it needs the keyring.
+  // Load persisted telemetry settings before the panels mount, so the
+  // Stats panel renders the stored toggles (not the defaults) on the
+  // first paint. With the memory store this is just the defaults.
+  // The keyring load likewise restores saved accounts (same store).
+  const appInstance = createArkNetzApp();
+  app = appInstance;
+  await appInstance.loadTelemetrySettings();
+  await appInstance.keyring.load();
+
   // OS deep links (arknetz://…): the Tauri deep-link plugin delivers
   // them via window.__TAURI__.deepLink when the app runs in the shell
   // (getCurrent at startup, onOpenUrl while running). In a plain
   // browser the listener reports "unavailable" and the app carries on
-  // — deep links simply cannot arrive there. A link opens in the
-  // current tab through the same navigation as a typed address.
+  // — deep links simply cannot arrive there. A site link opens in the
+  // current tab through the same navigation as a typed address; the
+  // OAuth callback (arknetz://oauth/callback) is intercepted before
+  // the site resolver and completes the GitHub sign-in instead.
   void installDeepLinkListener(window as unknown as Parameters<typeof installDeepLinkListener>[0], async (address) => {
     await go(address);
+  }, {
+    onOAuthCallback: (url) => completeGitHubSignIn(url),
   });
 
   // T1: intercept arknetz:// clicks ANYWHERE in the document (reader,
@@ -360,26 +469,25 @@ async function init(): Promise<void> {
   // search, comments, streaming, offline, stats, domains, moderation,
   // accounts, wayback, backends) and say plainly where a network/account
   // does not exist yet.
-  const app = createArkNetzApp();
-  // Load persisted telemetry settings before the panels mount, so the
-  // Stats panel renders the stored toggles (not the defaults) on the
-  // first paint. With the memory store this is just the defaults.
-  await app.loadTelemetrySettings();
-  mountPanels(app, $("panel-nav"), $("panel-host"), {
+  const panels = mountPanels(appInstance, $("panel-nav"), $("panel-host"), {
     getCurrentDoc: () => currentDoc,
     getGithubLogin: () => githubLogin,
-    getSiteStats: () => app.getSiteStats(currentDoc.domain),
-    getTelemetrySettings: () => app.getTelemetrySettings(),
-    setTelemetrySettings: (next) => app.setTelemetrySettings(next),
-    getProjectFlags: () => app.getProjectFlags(),
-    getLinkedBackends: () => app.getLinkedBackends(),
-    getLastMirrorAttempts: () => app.getLastMirrorAttempts(),
+    getSiteStats: () => appInstance.getSiteStats(currentDoc.domain),
+    getTelemetrySettings: () => appInstance.getTelemetrySettings(),
+    setTelemetrySettings: (next) => appInstance.setTelemetrySettings(next),
+    getProjectFlags: () => appInstance.getProjectFlags(),
+    getLinkedBackends: () => appInstance.getLinkedBackends(),
+    getLastMirrorAttempts: () => appInstance.getLastMirrorAttempts(),
+    onSignInWithGitHub: () => startGitHubSignIn(),
     showReader: () => {
       ($("editor") as HTMLElement).hidden = true;
       ($("reader") as HTMLElement).hidden = false;
     },
     showEditor: () => ($("edit-toggle-btn") as HTMLButtonElement).click(),
   });
+  // After a sign-in completes, rebuild the nav (Moderation appears
+  // only for the Root Master) and re-render the active panel.
+  panelsRefreshNav = panels.refreshNav;
 
   ($("go-btn") as HTMLButtonElement).onclick = () => go(($("address-input") as HTMLInputElement).value);
   ($("address-input") as HTMLInputElement).addEventListener("keydown", (e) => {
@@ -421,28 +529,10 @@ async function init(): Promise<void> {
     }
     renderBookmarks();
   };
-  ($("signin-btn") as HTMLButtonElement).onclick = () => {
-    const status = $("signin-status");
-    // B8: the status lives in its own strip below the topbar (hidden
-    // until there is a message) — show it when we have something to say.
-    const showStatus = (msg: string): void => {
-      status.textContent = msg;
-      status.hidden = false;
-    };
-    try {
-      const state = randomState();
-      sessionStorage.setItem("arknetz-oauth-state", state);
-      const url = buildAuthorizeUrl(state);
-      showStatus("Opening GitHub sign-in…");
-      window.open(url, "_blank", "noopener");
-    } catch (err) {
-      showStatus(err instanceof Error ? err.message : String(err));
-    }
-  };
-  // Master badge: only shown when a signed-in login matches; the shell
-  // has no signed-in user yet, so this stays "Guest" until auth lands.
-  void isMasterUser(null);
-  ($("guest-badge") as HTMLElement).textContent = `Guest · Master: ${MASTER_GITHUB_USER}`;
+  // Top-bar sign-in: the same flow as the Accounts panel's button.
+  ($("signin-btn") as HTMLButtonElement).onclick = () => startGitHubSignIn();
+  // Guest badge until a sign-in lands (refreshGithubStatus owns it).
+  refreshGithubStatus();
 
   // Visual builder: Edit mode on the document the reader is showing.
   // The editor edits a clone; closing it re-renders the reader from the

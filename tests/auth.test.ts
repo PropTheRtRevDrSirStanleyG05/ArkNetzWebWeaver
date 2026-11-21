@@ -21,6 +21,16 @@ test("buildAuthorizeUrl builds the real GitHub authorize URL with client_id, sco
   assert.match(url.searchParams.get("scope") as string, /read:user/);
 });
 
+test("buildAuthorizeUrl sets redirect_uri=arknetz://oauth/callback and both registered scopes", () => {
+  const url = new URL(buildAuthorizeUrl("state-xyz", "Iv1.testclient"));
+  assert.equal(url.searchParams.get("redirect_uri"), "arknetz://oauth/callback");
+  assert.equal(url.searchParams.get("scope"), "read:user public_repo");
+  // The default client id (config.ts) produces the same shape.
+  const def = new URL(buildAuthorizeUrl("s1"));
+  assert.equal(def.searchParams.get("client_id"), "Ov23lic8terv0XOd3GDe");
+  assert.equal(def.searchParams.get("redirect_uri"), "arknetz://oauth/callback");
+});
+
 test("randomState is 32 hex chars and unique", () => {
   const a = randomState();
   const b = randomState();

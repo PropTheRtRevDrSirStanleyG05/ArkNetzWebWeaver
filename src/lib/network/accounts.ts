@@ -530,3 +530,33 @@ export class AccountKeyring {
     return this.masterGithubUser;
   }
 }
+
+/** Add the GitHub account produced by a completed OAuth sign-in to
+ *  the keyring, like any other backend account — so it shows in the
+ *  Account Switcher Pill, becomes the active GitHub account (which is
+ *  what the Master Admin Badge keys off), and its token is encrypted
+ *  under the vault passphrase like every other token.
+ *  Re-signing in refreshes the stored token: an existing profile for
+ *  the login is removed and re-added with the fresh token (same id, so
+ *  site bindings pointing at it keep working). Throws when the keyring
+ *  is locked — the caller must say so loudly instead of dropping the
+ *  account silently; the in-memory session still works for that run. */
+export async function addGithubAccount(
+  keyring: AccountKeyring,
+  user: { login: string; avatarUrl?: string | null },
+  token: string,
+): Promise<AccountProfile> {
+  const id = user.login.toLowerCase();
+  if (keyring.getAccount("github", id)) {
+    await keyring.removeAccount("github", id);
+  }
+  const label =
+    user.login === MASTER_GITHUB_USER ? `${user.login} (Master)` : user.login;
+  const account = await keyring.addAccount(
+    "github",
+    { id, label, username: user.login, avatar: user.avatarUrl ?? undefined },
+    { kind: "token", token },
+  );
+  keyring.setActive("github", id);
+  return account;
+}

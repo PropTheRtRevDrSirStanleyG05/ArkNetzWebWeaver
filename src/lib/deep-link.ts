@@ -38,10 +38,44 @@
 //     this round, so the exact manual check is documented in
 //     INTEGRATION.md instead of claimed as verified.
 
+import { GITHUB_OAUTH_REDIRECT_URI } from "./config.js";
 import { isValidDomain } from "./types.js";
 
 /** The OS-registered custom scheme. */
 export const DEEP_LINK_SCHEME = "arknetz";
+
+/** The GitHub OAuth callback URL (config.ts), re-exported here so the
+ *  router and the shell test against the same value. */
+export const OAUTH_CALLBACK_URL = GITHUB_OAUTH_REDIRECT_URI;
+
+/** True for the OAuth callback URL (arknetz://oauth/callback, query
+ *  string allowed). It is NOT a site address — "oauth" is not a valid
+ *  domain (isValidDomain needs two labels), so parseDeepLinkUrl would
+ *  reject it and the old handler silently dropped it. The callback
+ *  must be intercepted before the site resolver, or the app would try
+ *  to load a site called "oauth" and fail. */
+export function isOAuthCallbackUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  return (
+    parsed.protocol === `${DEEP_LINK_SCHEME}:` &&
+    parsed.hostname.toLowerCase() === "oauth" &&
+    parsed.pathname === "/callback"
+  );
+}
+
+/** Optional handlers for deep links that are not site addresses. */
+export interface DeepLinkHandlers {
+  /** Called with the full callback URL when an OAuth callback arrives
+   *  (startup or while running). The handler owns the whole completion
+   *  (state check, code exchange, account) and reports its own errors
+   *  — a failure here must never break the deep-link listener. */
+  onOAuthCallback?: (url: string) => Promise<void> | void;
+}
 
 /** A parsed deep link: the domain to resolve plus the path inside it
  *  ("" for the site root, "/about" for arknetz://domain/about). */
@@ -83,19 +117,35 @@ export function deepLinkToAddress(link: ParsedDeepLink): string {
 
 /** Open every parseable URL in `urls` through `openTab` (in order),
  *  skipping unparseable ones silently — a stray CLI argument must
- *  never break startup. Returns how many links were opened. */
+ *  never break startup. OAuth callback URLs are intercepted first and
+ *  handed to `handlers.onOAuthCallback` instead of the site resolver.
+ *  Returns how many URLs were handled (site links opened + callbacks
+ *  intercepted). */
 export async function handleDeepLinkUrls(
   urls: readonly string[],
   openTab: (address: string) => Promise<void> | void,
+  handlers: DeepLinkHandlers = {},
 ): Promise<number> {
-  let opened = 0;
+  let handled = 0;
   for (const url of urls) {
+    if (isOAuthCallbackUrl(url)) {
+      if (handlers.onOAuthCallback) {
+        try {
+          await handlers.onOAuthCallback(url);
+        } catch {
+          // The handler reports its own errors (sign-in status strip);
+          // one bad callback must never break the listener or startup.
+        }
+      }
+      handled++;
+      continue;
+    }
     const parsed = parseDeepLinkUrl(url);
     if (!parsed) continue;
     await openTab(deepLinkToAddress(parsed));
-    opened++;
+    handled++;
   }
-  return opened;
+  return handled;
 }
 
 /** Minimal shape of the Tauri global the deep-link plugin exposes
@@ -115,6 +165,8 @@ export interface TauriGlobalScope {
 }
 
 export type DeepLinkListenerStatus =
+  // startupOpened counts every startup URL handled: site links opened
+  // plus OAuth callbacks intercepted (not just tabs opened).
   | { status: "installed"; startupOpened: number }
   | { status: "unavailable"; reason: string }
   | { status: "error"; reason: string };
@@ -123,11 +175,14 @@ export type DeepLinkListenerStatus =
  *  `window`). Reads the startup URLs via getCurrent() (the desktop
  *  path: the OS spawned this process with the URL as a CLI argument)
  *  and subscribes to onOpenUrl() for links arriving while the app
- *  runs (mobile / macOS path). Never throws: any failure is reported
- *  in the returned status and the app carries on without deep links. */
+ *  runs (mobile / macOS path). `handlers.onOAuthCallback` receives
+ *  OAuth callback URLs from both paths, before the site resolver.
+ *  Never throws: any failure is reported in the returned status and
+ *  the app carries on without deep links. */
 export async function installDeepLinkListener(
   scope: TauriGlobalScope,
   openTab: (address: string) => Promise<void> | void,
+  handlers: DeepLinkHandlers = {},
 ): Promise<DeepLinkListenerStatus> {
   const api = scope.__TAURI__?.deepLink;
   if (!api || typeof api.getCurrent !== "function" || typeof api.onOpenUrl !== "function") {
@@ -138,9 +193,9 @@ export async function installDeepLinkListener(
   }
   try {
     const startup = await api.getCurrent();
-    const startupOpened = startup ? await handleDeepLinkUrls(startup, openTab) : 0;
+    const startupOpened = startup ? await handleDeepLinkUrls(startup, openTab, handlers) : 0;
     await api.onOpenUrl((urls) => {
-      void handleDeepLinkUrls(urls, openTab);
+      void handleDeepLinkUrls(urls, openTab, handlers);
     });
     return { status: "installed", startupOpened };
   } catch (err) {

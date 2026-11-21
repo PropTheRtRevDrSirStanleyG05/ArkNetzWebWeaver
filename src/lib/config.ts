@@ -14,14 +14,20 @@ export const DEFAULT_ROOT_REPO = "PropTheRtRevDrSirStanleyG05/arknetz-protocol-r
 export const PROTOCOL_VERSION = "0.1.0";
 export const USER_AGENT = "ArkNetzWebWeaver/1.0";
 
-// GitHub OAuth app id. Empty until Stanley (or a fork) creates a GitHub
-// OAuth App and puts its client id here at build time. The client SECRET
-// must never be in this file or in the app bundle — the code exchange
-// happens in the Tauri Rust command (see src-tauri/src/main.rs), which
-// returns "not_configured" until a secret is supplied via the build
-// environment on the builder's own machine.
+// GitHub OAuth app id, registered 2026-11-21 (callback
+// arknetz://oauth/callback, scopes read:user public_repo). The client
+// SECRET must never be in this file or in the app bundle — the code
+// exchange happens in the Tauri Rust command (see
+// src-tauri/src/lib.rs), which reads it at runtime from
+// ARKNETZ_GITHUB_OAUTH_CLIENT_SECRET and returns "not_configured"
+// until it is supplied on the builder's own machine.
 export const GITHUB_OAUTH_CLIENT_ID = "Ov23lic8terv0XOd3GDe";
 export const GITHUB_OAUTH_SCOPES = ["read:user", "public_repo"];
+/** The OAuth redirect URI, registered on the GitHub OAuth App: the
+ *  OS hands this URL back to the app via the arknetz:// deep link,
+ *  and the deep-link listener intercepts it before the site resolver
+ *  (it is not a site address — "oauth" is not a valid domain). */
+export const GITHUB_OAUTH_REDIRECT_URI = "arknetz://oauth/callback";
 
 export const RAW_GITHUB_BASE = "https://raw.githubusercontent.com";
 export const GITHUB_API_BASE = "https://api.github.com";

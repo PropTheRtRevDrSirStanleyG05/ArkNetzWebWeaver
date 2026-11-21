@@ -1,0 +1,58 @@
+# ArkNetzWebWeaver — mirror.yml (LIVE workflow)
+# Daily mirror of the central repos to GitLab (gl:) and Codeberg (cb:)
+# for the pluggable-backend failover (PROTOCOL.md §5, §8): if GitHub is
+# down, clients fail over to the mirrors in milliseconds.
+# Reads mirrors.json in this repo: each entry names a central repo and
+# its GitLab/Codeberg remote URL (null = not linked yet). A repo with
+# no remote configured is skipped BEFORE cloning, so the workflow
+# succeeds before any mirror account exists. A remote URL carries a
+# __TOKEN__ placeholder, replaced at run time from the GL_MIRROR_TOKEN
+# / CB_MIRROR_TOKEN repo secrets; a missing secret skips that backend.
+# Runs daily (04:00 UTC) and on manual dispatch.
+name: Mirror central repos
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *" # daily, 04:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mirror each configured central repo
+        env:
+          GL_MIRROR_TOKEN: ${{ secrets.GL_MIRROR_TOKEN }}
+          CB_MIRROR_TOKEN: ${{ secrets.CB_MIRROR_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          doc = json.load(open("mirrors.json"))
+          owner = "PropTheRtRevDrSirStanleyG05"
+          tokens = {"gl": os.environ.get("GL_MIRROR_TOKEN", ""), "cb": os.environ.get("CB_MIRROR_TOKEN", "")}
+          for entry in doc["repos"]:
+              repo = entry["repo"]
+              targets = [(b, entry.get(k)) for b, k in (("gl", "gitlabUrl"), ("cb", "codebergUrl")) if entry.get(k)]
+              if not targets:
+                  print(f"SKIP {repo}: no mirror remote configured in mirrors.json")
+                  continue
+              src = f"https://github.com/{owner}/{repo}.git"
+              clone = subprocess.run(["git", "clone", "--mirror", src, repo + ".git"], capture_output=True, text=True)
+              if clone.returncode != 0:
+                  print(f"SKIP {repo}: cannot clone from GitHub (repo may not exist yet)")
+                  continue
+              for backend, url in targets:
+                  token = tokens[backend]
+                  if not token:
+                      print(f"SKIP {repo} -> {backend}: no {backend.upper()}_MIRROR_TOKEN secret")
+                      continue
+                  remote = url.replace("__TOKEN__", token)
+                  push = subprocess.run(["git", "-C", repo + ".git", "push", "--mirror", remote], capture_output=True, text=True)
+                  print(("OK " if push.returncode == 0 else "FAIL ") + f"{repo} -> {backend}")
+                  if push.returncode != 0:
+                      print(push.stderr[-2000:])
+          PY

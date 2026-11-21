@@ -1,12 +1,13 @@
-# ArkNetzWebWeaver — register.yml
-# Free GitHub Action template that processes REGISTER domain claims.
+# ArkNetzWebWeaver — register.yml (LIVE workflow)
+# The domain-claim flow: processes REGISTER domain claims in the
+# registry shard repo it runs in.
 #
 # Where it lives: one copy in EACH registry shard repo
 # (arknetz-registry-00 … arknetz-registry-0f, under the master account
 # PropTheRtRevDrSirStanleyG05). The shared copy is kept in the
-# arknetz-actions repo; this file is the template to ship with the
-# protocol repo. It is NOT executed in this scaffold — there are no
-# central repos yet and no GitHub writes happen here.
+# arknetz-actions repo; the source of truth is protocol/register.yml
+# in the client repo. It IS executed in every shard repo — a REGISTER
+# issue in a shard runs this workflow there.
 #
 # Flow (thread: claims via GitHub Issue, ~5-10 s):
 #   1. A user opens an Issue titled `REGISTER: computers.edu`.
@@ -77,9 +78,10 @@ jobs:
         env:
           DOMAIN: ${{ steps.parse.outputs.domain }}
           CLAIMANT: ${{ steps.parse.outputs.claimant }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python3 - <<'PY'
-          import json, os, re, subprocess
+          import hashlib, json, os, re, subprocess
           domain = os.environ["DOMAIN"]
           out = open(os.environ["GITHUB_OUTPUT"], "a")
           def reject(reason):
@@ -99,6 +101,17 @@ jobs:
           hit = next((l for l in labels if l in banned), None)
           if hit:
               reject(f'"{domain}" cannot be registered - the word "{hit}" is reserved.')
+          # Shard check: this workflow runs in ONE shard repo
+          # (arknetz-registry-0x). A claim filed in the wrong shard
+          # must be refused, not written to the wrong shard — the
+          # app's resolver throws on a wrong-shard entry, so a wrong
+          # write would corrupt the registry instead of registering.
+          shard = hashlib.sha256(domain.encode()).hexdigest()[0]
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          owner = repo.split("/")[0] if "/" in repo else "PropTheRtRevDrSirStanleyG05"
+          want = f"arknetz-registry-0{shard}"
+          if not repo.endswith("/" + want):
+              reject(f'"{domain}" belongs in {want}, not this shard. Open the REGISTER issue there instead: https://github.com/{owner}/{want}/issues/new?title=REGISTER%3A+{domain}')
           # Availability: decompress the canonical shard and look the
           # domain up. A missing shard file means nothing is registered
           # in this shard yet, so the domain is available.
@@ -108,7 +121,13 @@ jobs:
               data = json.loads(raw)
               entries = data if isinstance(data, dict) and "entries" not in data else {e["domain"]: e for e in data.get("entries", [])}
           except FileNotFoundError:
-              pass
+              # No zstd CLI on this runner: read the plain mirror.
+              try:
+                  with open("registry.json") as f:
+                      data = json.load(f)
+                  entries = data if isinstance(data, dict) and "entries" not in data else {e["domain"]: e for e in data.get("entries", [])}
+              except FileNotFoundError:
+                  entries = {}
           except subprocess.CalledProcessError:
               # No .zst yet: fall back to the plain registry.json mirror.
               try:
@@ -148,6 +167,10 @@ jobs:
               state: "closed",
               labels: ["invalid"],
             });
+
+      - name: Ensure zstd is available
+        run: |
+          if ! command -v zstd >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y -qq zstd; fi
 
       - name: Commit the new registry entry
         if: steps.check.outputs.result == 'ok'
