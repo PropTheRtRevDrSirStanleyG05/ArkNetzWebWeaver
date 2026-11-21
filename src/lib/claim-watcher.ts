@@ -7,16 +7,15 @@
 // registered when the issue closes.
 //
 // NOTE on the live workflow: the issue-based contract below is what
-// the client was built against (see domains.ts / site-repo.ts), but
-// the LIVE register.yml in the 16 registry shards is PR-based
-// (Ed25519 pubkey + endpoint), and Stanley's ruling on that
-// divergence is still pending. Under the live PR-based workflow a
-// REGISTER issue can never resolve — the watcher will keep reporting
-// "pending" until it is stopped, and a 404/401 stops it with a plain
-// reason instead of spinning. The watcher is written against the
-// issue-based contract on purpose; when the ruling lands, the
-// resolution signal (issue close vs PR merge) is the one thing that
-// changes.
+// the client was built against (see domains.ts / site-repo.ts), and
+// Stanley ruled ISSUE-based on 2026-11-21 06:28 — the live PR-based
+// register.yml (Ed25519 pubkey + endpoint) in the 16 registry shards
+// is being replaced with the issue-based workflow. The watcher is
+// written against the issue-based contract: it reports the claim as
+// registered when the issue closes. If an issue can never resolve
+// (e.g. a shard still runs the old PR-based workflow), the watcher
+// keeps reporting "pending" until it is stopped, and a 404/401 stops
+// it with a plain reason instead of spinning.
 
 import { GITHUB_API_BASE } from "./config.js";
 import type { GithubFetchFn } from "./publish.js";

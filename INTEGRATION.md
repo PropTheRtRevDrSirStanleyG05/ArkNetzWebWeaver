@@ -1844,3 +1844,94 @@ no push to GitHub; seed tree and /tmp/repush-seed.py untouched.
   joining as alice and leaking live poll timers, which hung the whole
   suite run), and the collab assertions read `#editor-status` while
   the joined state lives in `#collab-status`.
+
+## Bug hunt 2 — on the uploaded product (2026-11-21)
+
+Three tracks (source verification, visual QA, feature surfaces) run
+against the live GitHub product (client head d07c5bb), then two fix
+passes. `npm test`: **596 → 618 → 627 pass, 0 fail** throughout.
+Headless verification of the visual fixes: 11/11 checks, 0 console
+errors. Screenshots: `~/workspace/arknetzwebweaver/qa-screenshots/hunt2/`
+(hunt) and `.../hunt2-fix/` (fix verification).
+
+### Track 1 — source verification (no drift, binaries proven)
+- Clone of the live client repo at d07c5bb diffed against the scaffold:
+  zero content differences (local-only: dict-training corpus,
+  dictionary .bin, Tauri-generated `src-tauri/gen/`).
+- All 7 live binaries sha256-identical to local seeds and
+  decompressed with the app's real zstd path: registry-00/0f
+  `registry.json.zst`, contacts-00 `contacts.json.zst`,
+  moderation `moderation.json.zst`, dictionary v1/v2 `.bin`,
+  protocol-root manifest (protocol 0.1.0, 16+16 shards,
+  `pendingRepos` = the 13 missing repos at the time).
+- The 10 repos created later (contacts-0a–0f, feed-2026-11,
+  directory-tech/cinema/games) had their `.zst` files verified the
+  same way — all sha256-match local seeds.
+- Live `register.yml` confirmed PR-based (blob f695c533) vs the
+  issue-based client flow. **Stanley ruled ISSUE-based 2026-11-21
+  06:28**; the live workflow is being replaced via the web UI.
+
+### Track 3 — feature surfaces (all work, 6 defects)
+- Two-peer collab convergence + same-block conflicts both
+  directions; tables/lists render + escape correctly; claim flow
+  refuses exactly with no token and fails cleanly on a fake token;
+  HTML importer on 4 fixtures (scripts/iframes/`javascript:`
+  stripped and counted); OAuth chain complete up to the live
+  exchange (needs Stanley's runtime secret).
+
+### Fixes applied
+- D2 (HIGH): collab relay now addresses the site OWNER's repo
+  (`siteOwner` plumbed from the document/registry; `EditorState.collabSiteOwner`).
+- D1 (MEDIUM): gracefully-left peers removed on next poll;
+  silent peers show "(away)" for a 5-min grace (`PEER_PRUNE_AFTER_MS`)
+  then prune. (Fix pass 1 briefly pruned at 30 s, removing the
+  "(away)" phase; pass 2 restored the stale window.)
+- D3 (MEDIUM): new `src/lib/claim-watcher.ts` polls the REGISTER
+  issue every 30 s while a claim is pending; closed → resolved,
+  404/401 → failed and stops.
+- D6 (HIGH): the Account Switcher Pill is now real UI — top-bar
+  button + dropdown in `src/index.html`, `src/lib/network/account-pill.ts`
+  controller, switch wiring in `main.ts` (locked keyring refuses
+  before anything changes).
+- D4/D5 (LOW): stale data-URL comment deleted; the 512 KB data-URL
+  cap now lives in `isSafeUrl` so every path enforces it.
+- H1 (HIGH): `.an-slash-row` wraps at 390px (was 539px wide, "+ Block"
+  off-viewport).
+- M2 (MEDIUM): the editor canvas now renders inline formatting
+  (`setEditableContent` + `renderInlineRuns` in contenteditables).
+- M3: `showPanel()` scrolls the panel host into view.
+- M4: HTML-URL import failures surface in the status line
+  (with a 10 s hold so an autosave can't overwrite the message).
+- M5: switching to any non-builder panel closes the editor.
+- L6–L11: terms checkbox + label together; editor status on its
+  own full-width row; collab error de-duplicated; code-block scroll
+  fade; pill wraps instead of truncating; import-URL input widened;
+  "Not collaborating." no longer wraps mid-phrase.
+
+### register.yml dictionary fix (found during the hunt, blocks the rollout)
+- The issue-based `protocol/register.yml` decompressed the canonical
+  shard with a bare `zstd -d` and recompressed with a bare `zstd`.
+  Canonical files ARE dictionary-compressed (dict ID 0x41524B02):
+  bare `zstd -d` fails with "Dictionary mismatch" (proven), so the
+  availability check silently fell back to the plain mirror, and a
+  successful claim would have rewritten the canonical file as a
+  plain frame. Fixed: the workflow now fetches the v2 dictionary
+  from the protocol repo and uses `-D` for both steps (plain
+  fallback kept if the fetch fails). Verified by simulation:
+  with-`-D` read + write frames carrying DictID 1095912194
+  (0x41524B02); YAML parses. The app itself reads both frame kinds
+  (proven with `decompressBytesWithDictionary`), so no shipped
+  client change was needed — but the web-UI replacement of the
+  live workflow MUST use this fixed file, not the pre-fix copy.
+- Manifest `pendingRepos` corrected to only the 3 repos that still
+  do not exist (`arknetz-actions`, `arknetz-mirrors`,
+  `arknetz-website`); re-pushed to arknetz-protocol-root.
+
+### Still not verified live (do not claim)
+- Live OAuth sign-in (needs Stanley's runtime client secret),
+  live mail round-trip, live IA upload (needs a test account's
+  own keys), live collab session between two signed-in peers,
+  live REGISTER round-trip under the new issue-based workflow
+  (no Action run has happened anywhere yet), deep-link end-to-end
+  launch, AppImage launch (no /dev/fuse in VM), Windows.exe on
+  real Windows, Android.apk signing + install.
