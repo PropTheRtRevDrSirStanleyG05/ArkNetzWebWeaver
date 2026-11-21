@@ -2428,3 +2428,313 @@ live REGISTER round-trip
   live); protocol-repo README + PROTOCOL.md re-push DONE — live head
   `985d2098606ef49e32af7087a7dcda8a6f237d43` (2 files, byte-verified).
   No release created; keystore untouched.
+
+## P2P phase 2 — wiring the transport core into the app (2026-11-21)
+
+P2P-SPEC.md §13, implemented against the live scaffold (head
+`bcc7cb09`, v0.4.1 at dispatch; the zstd dictionary drop landed in
+the same tree mid-task — see the section above — and this section's
+push sits on top of it). No media file touched (`media-*.ts`,
+`call-session.ts`, `mixer.ts` belong to the parallel media agent).
+No `tauri build` run (release artifacts come later from the finished
+tree). No release created; keystore untouched; dictionary untouched.
+
+- **Settings + panel (`src/lib/p2p/store.ts`, `src/lib/p2p/panel.ts`,
+  `src/lib/app.ts`, `src/lib/panels.ts`):** per-device settings in
+  IndexedDB (`createIndexedDBP2PStore`, memory store in tests) with
+  the same mirror pattern as the telemetry settings — the panel
+  render/wire path is synchronous, the store write happens in the
+  background. New `P2P` panel in `APP_PANELS` (after Backends, before
+  Settings) with master switch + per-feature toggles (`sites`,
+  `collab`, `mail`, `drive`, `serveSites` — flat settings shape, no
+  `features` nesting), peer-ID rotation/reset (reset also wipes every
+  setting + TURN key), TURN fields (master switch, provider select
+  none/metered-openrelay/cloudflare/custom, one API-key field,
+  custom URLs, freeturn + Open Relay demo checkboxes), the relay
+  privacy note verbatim (`P2P_RELAY_PRIVACY_NOTE`), and the
+  connection-diagnostics line (`describeIcePath` summaries per
+  connected peer + ICE servers in effect). Feature toggles are
+  disabled while the master is off, so the panel can never read as
+  "collab on" while P2P itself is off. Verified in headless Chrome
+  at desktop + 390px (6 shots in `qa-screenshots/p2p-phase2/`:
+  desktop all-off, desktop master-on, 390px, 390px master-on, TURN
+  section with the relay privacy note + ICE-servers-in-effect line,
+  bottom — the last two are the same scroll position, the page ends
+  at the TURN section). Harness `scripts/p2p-panel-shots.mjs`
+  (CDP over Node's built-in WebSocket, no deps): two bugs fixed
+  while building it — under flat mode, session messages must carry
+  a top-level `sessionId` (Chrome rejects
+  `Target.sendMessageToTarget` with -32000, and the unlistened
+  error reply was the silent 120 s hang), and panel nav buttons
+  are `button[data-panel]` with no id.
+- **Host (`src/lib/p2p/host.ts`):** owns the PeerManager, signaling,
+  mail delivery, settings store load/persist, `configureIdentity`
+  (address, GitHub login, own token, mail private key — in-memory
+  only, never stored), `setRegistryResolver` (the shell owns the
+  resolver; until it is wired, peer-ad lookups fail closed to
+  GitHub), `setMailEnvelopeHandler`, `setDriveChunkSink`,
+  `setKnownVaultIds`, `setCachedBundleProvider`, `publishAd`
+  (capabilities from enabled flags, serves = own domains, TURN URLs
+  without credentials), `fetchAdForAddress` (contacts entry →
+  GitHub login, else registry owner → `peer-ad.json`, validates
+  `ad.address` matches), `connectToAddress`/`connectToAd`,
+  `pollSignalsOnce` (sealed signal Issues → peer manager, processed
+  ones closed), `loadSiteViaPeer` (peer first, null on any failure),
+  `deliverMail`/`sendDraft` (P2P first, Issue inbox fallback),
+  `pushDriveChunk` (own-device peers only: `ad.owner ===` self
+  GitHub login + `drive` capability), `createCollabHook`
+  (P2PCollabSession per peer, lazy connect on presence, poll slowing
+  via session events). Timers: signal poll 30 s, ad republish 15 min,
+  silence check 60 s — all start only once identity is configured
+  and the master switch is on. `P2P_COLLAB_SLOW_POLL_MS = 30_000`.
+  Honest limits recorded in the code: a peer whose mail domain they
+  do not own has no site repo of their own to host an ad in, so they
+  cannot be discovered via `fetchAdForAddress` yet (falls back to
+  relay); the mail adapter attaches only once an envelope handler
+  exists, so no envelope is ever acked then lost; `meteredOwnTurnServers`
+  returns [] by design (a bare API key is not a TURN entry); drive
+  push is push-on-upload only (no chunk-request/pull protocol in
+  phase 1's adapter).
+- **Site reader (`src/main.ts` `renderCurrent`):** tries
+  `p2pHost.loadSiteViaPeer(domain, resolver.resolve)` before
+  `resolver.loadSite`; any P2P failure returns null and the reader
+  loads from the CDN exactly as before, silently. Serving uses the
+  reader's ETag cache (`setCachedBundleProvider` → `fetcher.fetchBytes(siteZstUrl(entry))`) —
+  a bundle already fetched stays servable; serving never fetches from
+  the CDN on someone else's behalf.
+- **Collab (`src/lib/collab/session.ts`, `src/lib/editor.ts`,
+  `src/lib/editor-ui.ts`):** new `CollabP2PHook` /
+  `CollabP2PHookEvents` interface; the session starts the hook on
+  `join()` (a hook failure never breaks the relay join), forwards
+  local ops/cursors (`broadcastOps`/`setCursor`), applies remote P2P
+  ops through the editor's `applyRemoteBlockOps` (same LWW merge as
+  relay states), and records remote P2P cursors in presence
+  immediately. `onConnected` slows the relay poll to 30 s
+  (`COLLAB_P2P_SLOW_POLL_MS`, `currentPollMs` getter added for
+  diagnostics/tests); `onDropped` restores the 5 s default. The
+  editor passes the hook through `CollabStartOptions.p2p` and notes
+  relay-poll presence to it (`notePresence`); the editor UI takes it
+  from `getCollabP2PHook(domain)` (the app returns null unless P2P
+  is enabled + collab is on — relay-only otherwise). Team
+  membership is checked by the host before accepting a P2P session
+  (`createCollabHook` takes the team logins; the hook connects
+  lazily only to logins the relay poll reports).
+- **Mail (`src/lib/panels.ts`, `src/main.ts`):** the compose panel
+  gains a real **Send** button (the old "sending stays disabled"
+  copy is replaced): the shell's `sendProtocolMail` seals once via
+  `host.sendDraft` and delivers per recipient — P2P first when the
+  recipient is an online peer, otherwise the GitHub inbox Issue —
+  and falls back to a direct `MailDelivery.deliver` per recipient
+  when the host has no identity configured, so a send never fails
+  for a P2P reason. Not signed in → exact refusal, zero GitHub
+  calls. The mail panel also gains a **Refresh inbox** button
+  (`pollInbox` → `Inbox.receive` → re-render). The shell configures
+  the P2P identity on sign-in (device flow + redirect) and on
+  keypair creation (`onMailKeypair`), and sets the inbound envelope
+  handler to the normal inbox store once a keypair exists. The
+  host's own signal timer (30 s) polls `arknetz-signal` Issues.
+- **ArkDrive (`src/lib/drive/drive.ts`, `src/lib/app.ts`,
+  `src/main.ts`):** `VaultManager` gains an optional
+  `VaultManagerHooks.onChunkUploaded(vaultId, blobId, storedBytes)`
+  (fires only for NEW chunks — deduped chunks do not fire) and
+  `importStoredChunk(vaultId, blobId, storedBytes)` — verifies the
+  vault id, AES-GCM-decrypts under the open vault's key (a wrong key
+  or tampered bytes fails here), hashes the plaintext, writes the
+  blob to the repo (skipped when already there), and records it in
+  the in-memory manifest for dedup; the manifest itself is NOT saved
+  by import (it stays the repo's durable copy). `app.openVault`
+  wires the hook to `p2pHost.pushDriveChunk`; the shell wires the
+  sink (`onVaultOpened` → `setKnownVaultIds` + `setDriveChunkSink`
+  → `importStoredChunk`) when a vault opens. Repo blobs stay the
+  durable copy; P2P only moves bytes faster.
+- **Docs:** PROTOCOL.md §16 (new section after the changelog)
+  merges P2P-SPEC.md §2 (identity + `peer-ad.json`), §3 (sealed
+  signaling Issues), §4 (data channels + framing), §7 (STUN/TURN),
+  plus §16.5 (phase-2 wiring); changelog entry added to §15.
+  REPO-TOPOLOGY.md records `peer-ad.json` on the per-domain site
+  repo and the `arknetz-signal` Issues in `arknetz-inbox`.
+- **Phase-1 import bugs fixed while wiring (they blocked `tsc`):**
+  `src/lib/p2p/store.ts` imported `defaultP2PSettings` from
+  `./identity.js` (it lives in `./types.js`); `src/lib/p2p/host.ts`
+  imported `contactsShardZstUrl` from `../registry.js` (it lives in
+  `../mail/contacts.js`) and `RegistryEntry` from `../registry.js`
+  (it lives in `../types.js`); `sendSignal`'s `githubUser` narrowing
+  replaced with the same `??` form `deliverMail` already used.
+  (The dispatch note said `tsc` showed exactly 5 errors, all in
+  media files — these three import errors were already in the tree;
+  `tsc --noEmit` is fully clean after this pass, media files
+  included.)
+- **Tests:** new `tests/p2p-phase2.test.ts` — 11 tests, 0 fail
+  (panel render all-off + connected-peer diagnostics; mount master
+  toggle + feature flip + TURN fields + rotate/reset via a tiny fake
+  DOM; collab hook start/poll-slow/restore/leave + op/cursor
+  forwarding + failed-hook join; vault import round-trip incl. dedup,
+  wrong-vault refusal, tampered-bytes refusal; app accessors +
+  persistence + rotation/reset; host `sendDraft` GitHub fallback
+  with P2P off). Full battery: **770 tests, 770 pass, 0 fail**
+  (2026-11-21 ~23:45 UTC; `npm test`, 21.1 s of test time). The 4
+  panel-count failures from the 766/770 run are fixed by the 15 → 16
+  count fix (`tests/app.test.ts`, `tests/panels.test.ts`); the
+  mail-panel test's stale "Drafts are real and saved locally"
+  assertion was replaced with phase-2 assertions (real Send button
+  `an-mail-send-btn` + P2P-first delivery note). The earlier
+  17-minute battery run was CPU-starved by a concurrent battery +
+  screenshot harness and was killed before it finished; this 770/770
+  is the clean re-run after the fixes.
+- **Push:** TODO-PUSH (client repo only; no release; no keystore;
+  no dictionary touch).
+- **Still needs real-device verification (not claimable from this
+  VM):** two real devices, one behind symmetric NAT, with and
+  without TURN — real WebRTC peer connections (no WebRTC in Node),
+  live peer-ad publish/fetch, live sealed-signal handshake, live
+  P2P site fetch, live two-peer collab over P2P, live P2P mail
+  delivery, live P2P drive chunk sync, the diagnostics line showing
+  a real `relayed via <operator>` path, and the 30 s relay-poll
+  slowing observable in a live session.
+
+---
+
+## Real-time media (voice / video / screenshare) — core, 2026-11-21
+
+Stanley 2026-11-21 14:51–14:54: "do it all" — encrypted voice,
+video calling, screensharing over P2P, a Discord competitor with
+no server; group calls use a **peer-volunteered mixer** (no
+third-party SFU). Spec: `~/workspace/arknetzwebweaver/MEDIA-SPEC.md`
+(12 sections). **Core only — NOT wired into any UI yet.** UI
+wiring (Calls panel, call controls, ringing UI, mixer identity
+display, recording UI) is a later phase, dispatched separately;
+exact wiring points are MEDIA-SPEC.md §11.
+
+### What was built (new files only, no existing file edited)
+
+`src/lib/p2p/`:
+
+- `media.ts` — types, constants, control-message framing
+  (`[0x01][UTF-8 JSON]` on data channel `arknetz/media`),
+  `electionScore` / `electMixer` pure functions, `MediaSettings`
+  (everything off by default, including `volunteerMixer`), UI copy
+  strings. Constants: mesh ceiling 5, video degrade 300 kbps /
+  restore 600 kbps with dwell (5 s down, 10 s up), invite 60 s,
+  media-connect 30 s, mixer minimums 2000 kbps / 0.2 headroom
+  over 30 s, `MIXER_SWITCH_MARGIN = 0.1`.
+- `media-devices.ts` — `getUserMedia` / `getDisplayMedia`
+  wrappers with structural `MediaTrackLike` / `MediaStreamLike` /
+  `MediaDevicesLike` interfaces (real browser wrappers +
+  `FakeMediaDevices` test double with constraint capture and
+  failure injection). Audio constraints: echo cancellation,
+  noise suppression, AGC all on. `detectScreenShareSupport`.
+- `media-connection.ts` — `WebRtcMediaConnection` (real,
+  browser-only; throws a plain error in Node) with
+  `degradationPreference: "maintain-framerate"` on senders,
+  `summarizeMediaStats` (prefers candidate-pair
+  `availableOutgoingBitrate`, returns undefined rather than
+  guessing), plus `FakeMediaConnection` paired twins (tracks
+  added before pairing are still delivered — call setup adds
+  local tracks before the remote side exists).
+- `call-session.ts` — `CallSession` 1:1 state machine
+  (idle/inviting/ringing/connecting/connected/ended/declined/
+  failed), mute/video toggles, `switchCamera(deviceId?)`,
+  `replaceVideoTrack` / `restoreVideoTrack`, quality monitor
+  (2 s `getStats()` poll, audio never degraded by the monitor),
+  recording-consent map (`canRecord()` requires self AND remote
+  consent; silence is never consent), `CallManager` (incoming
+  routing, busy-decline, chains onto a previously-set `onchannel`
+  handler for non-media labels), `LocalCallRecorder`
+  (consent-gated, local only; `browserRecorderFactory()` is
+  null in Node), `iceFailureReason` (`no-relay` only when no
+  TURN is configured at all).
+- `screen-share.ts` — `ScreenShareSession` (desktop
+  `getDisplayMedia`, screen track replaces camera via
+  `replaceTrack`, OS-picker `onended` wired to stop, stop
+  restores camera). **Android is a typed stub**:
+  `ScreenShareUnavailableError` with reason
+  `android-media-projection-bridge-missing`; it throws before
+  touching any device and never fakes it. What "built" would
+  mean: a small Rust plugin in `src-tauri` exposing
+  MediaProjection capture.
+- `mixer.ts` — `GroupCall`: membership, coordinator =
+  longest-joined participant, mesh ≤ 5, volunteer-mixer
+  election above that, forwarding table
+  (`forwarded: Map<source, Map<target, sender>>`),
+  `dropForwardingFor` / `clearForwarding`, degraded-mixer
+  step-down, `handleControl` for group/mixer messages,
+  `connectionTo` (lazily creates media PCs, wires `ontrack` →
+  `onRemoteTrack`). Mixer = selective forwarding (SFU): NO
+  video re-encode, NO audio mixing in v1 (Web Audio
+  decode+mix+re-encode is a documented stretch goal with its
+  CPU/latency cost, not built, not claimed).
+
+### The trust boundary — read before wiring the UI
+
+A plain selective-forwarding mixer terminates DTLS-SRTP **per
+leg**, so it holds the SRTP keys for each leg and its browser has
+access to the decoded media it forwards. **A mixer peer CAN
+technically access the media it forwards. It is NOT a blind
+forwarder.** This is stated exactly in MEDIA-SPEC.md §6.4 and
+follows the technical truth, even though the original task brief
+asserted the opposite. Mitigation in the design: the role is
+visible (the group always knows who the mixer is), opt-in, and
+revocable. What would make the mixer blind: an additional
+end-to-end layer (SFrame / insertable streams) with a group key
+not shared with the mixer — documented future hardening, NOT
+built, NOT claimed. The mixer never sees sealed mail or drive
+chunks (different channels, different crypto).
+
+### Limits position (Stanley 2026-11-21 14:55) applied
+
+No hard limits designed around: no quota budgeting, no relay
+rationing in the media core. The phase-1 512 KiB/s token bucket
+is a user-adjustable default (0 = unlimited), not a limit.
+Quota exhaustion on a shared fallback (freeturn.net, Open Relay
+demo credential) is a graceful-degradation event: data features
+fall back to GitHub; the diagnostics line shows it. The ONE
+honest carve-out, specific to live calls: a call has no GitHub
+fallback — if a pair cannot connect directly and has no working
+relay, that call cannot connect at all, audio and video both
+(`iceFailureReason` → `no-relay` when no TURN is configured at
+all, `ice-failed` when a relay was configured and failed); the
+answer is the BYO TURN path, not rationing. No new
+quota-tracking or usage-metering code was added. The relay
+warning stays in the call UI spec as information, not a limiter.
+
+### Tests — 52 pass, 0 fail
+
+`tests/p2p-media.test.ts`, `p2p-media-devices.test.ts`,
+`p2p-media-connection.test.ts`, `p2p-call-session.test.ts` (12),
+`p2p-screen-share.test.ts`, `p2p-mixer.test.ts`. Verified two
+ways: isolated battery over the media closure **52 pass, 0
+fail**; full battery **770 tests, 766 pass, 4 fail** — the 4
+failures are app/panels panel-count tests from the parallel
+phase-2 wiring work (16 panels registered vs 15 expected),
+zero media failures. Real WebRTC cannot run in Node: all
+media flows use the phase-1 loopback/fake transports; every
+real-media behavior is marked as needing two real devices
+(MEDIA-SPEC.md §10/§11).
+
+**Two real bugs the battery caught and fixed:**
+
+1. CallManager busy check only declined a second invite from
+   the *same* peer — a third peer rang straight through a live
+   call. Now any active session (ringing/connecting/connected/
+   inviting) means busy for any caller: a device handles one
+   call at a time in v1 (MEDIA-SPEC.md §3, recorded in the
+   spec alongside the fix).
+2. Once a mixer was elected, a better volunteer joining later
+   never triggered re-election (`updateMode` early-returned
+   while the mixer was alive). Now the coordinator re-runs the
+   election on every membership change and switches only when
+   the challenger beats the incumbent by more than
+   `MIXER_SWITCH_MARGIN = 0.1` (tested both directions: a
+   clearly better volunteer takes over; a marginally better one
+   does not, so the group never flaps mid-call).
+
+Test-harness notes (for the next agent): the loopback
+`createPair` names connections by their REMOTE peer
+(`createPair(PEER_B, PEER_A)` for A's connection to B — see
+`p2p-peer-manager.test.ts`); getting this backwards makes
+`CallManager.sendTo` silently drop every invite. And a
+`CallSession` rejection that fires during a `flush()` must have
+its `assert.rejects` handler attached *before* the flush, or
+Node reports an unhandled rejection; a test that fails before
+`session.end()` leaves the 2 s quality-monitor interval alive
+and the `node --test` file process never exits.

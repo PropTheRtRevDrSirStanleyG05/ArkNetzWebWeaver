@@ -55,6 +55,7 @@ import { importWxr } from "./wxr.js";
 import { importHtml, importHtmlFromUrl } from "./html-import.js";
 import type { HtmlFetchFn, HtmlImportResult } from "./html-import.js";
 import { describePeerCursors } from "./collab/cursors.js";
+import type { CollabP2PHook } from "./collab/session.js";
 import { isTopHiddenBelowTopbar, scrollBelowTopbar } from "./scroll.js";
 import { describeConflict } from "./collab/types.js";
 import { buildSiteOpenedViewModel } from "./domains-ui.js";
@@ -83,6 +84,10 @@ export interface EditorUiOptions {
   /** Fetch for the HTML importer's URL import (plain fetch, no auth).
    *  Defaults to an adapter over githubFetch. */
   htmlFetch?: HtmlFetchFn;
+  /** Optional P2P collab hook for this domain (phase 2). Absent =
+   *  relay only. The hook is created per domain by the app shell
+   *  (it needs the P2P host + the site's team list). */
+  getCollabP2PHook?: (domain: string) => CollabP2PHook | null;
 }
 
 export interface EditorUiOptions {
@@ -890,6 +895,9 @@ export class EditorUI {
         login: login ?? "",
         fetchFn: this.opts.githubFetch,
         autoPoll: true,
+        // P2P rides alongside the relay when the app has a host and
+        // P2P collab is enabled; relay-only when absent.
+        p2p: this.opts.getCollabP2PHook?.(this.editor.doc.domain) ?? undefined,
       });
     } catch (err) {
       // The engine refuses loudly without a token (or when the relay

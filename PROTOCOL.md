@@ -1005,3 +1005,309 @@ Google Lighthouse. **UNVERIFIED:** the Lighthouse target and the
   first-class block types (`listStyle`/`listItems`, `rows`/`headerRow`),
   with the in-editor rich-text toolbar for both. Typed inline runs
   only — never raw HTML.
+- **P2P phase 2 (2026-11-21, §16):** optional WebRTC transport wired
+  into the app (P2P-SPEC.md §2, §3, §4, §7 merged as §16). All off by
+  default; GitHub stays the fallback and source of truth. Zstd v2
+  dictionary drop landed the same day (separate job): new frames are
+  plain zstd, old dictionary frames still decode — §4's dictionary
+  notes are historical from here on.
+
+## 16. Peer-to-peer transport (optional, off by default)
+
+Merged from P2P-SPEC.md §2 (identity + peer ads), §3 (signaling),
+§4 (transport + framing), §7 (NAT traversal). The full spec lives
+in `P2P-SPEC.md` at the repo root of the client; this section is the
+normative protocol summary. P2P is an **accelerator under the
+features that already exist** — it never replaces GitHub as the
+source of truth, and every P2P failure falls back to GitHub
+silently. With P2P off (the default) the client publishes no ad,
+fetches no ads, and answers no signal Issues.
+
+### 16.1 Identity and peer advertisements (`peer-ad.json` v1)
+
+- **Peer ID:** a random 128-bit value, hex-encoded (32 chars),
+  generated locally per device on first P2P use and persisted
+  per device (IndexedDB, alongside the settings — a phone and a
+  laptop have different peer IDs). It is **not** derived from the
+  GitHub login or the mail address: one login maps to many devices,
+  and a peer ID identifies a device, not an account. The user can
+  **rotate** it (new random ID, republish the ad) and **reset** P2P
+  identity (new ID + every setting and TURN key cleared) at any time.
+- **Advertisement:** `peer-ad.json` (v1) published at
+  `peer-ad.json` on `main` of the user's per-domain site repo
+  (`arknetz-site-<domain-slug>` — the same repo the registry points
+  at; see REPO-TOPOLOGY.md). Public by design: it contains no
+  secret, no key, no credential.
+
+```json
+{
+  "v": 1,
+  "peerId": "9f2c…a1 (32 hex chars)",
+  "address": "alice@example.arknetz",
+  "domain": "example.arknetz",
+  "owner": "alice",
+  "capabilities": ["site", "collab", "mail", "drive"],
+  "serves": ["example.arknetz", "blog.example.arknetz"],
+  "turn": { "urls": ["turn:turn.example.com:3478"] },
+  "updatedAt": 1793123456789,
+  "expiresAt": 1793127056789
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `v` | `1`. Readers reject any other version loudly. |
+| `peerId` | 32 hex chars, random per device. |
+| `address` | The peer's protocol mail address (lowercase). |
+| `domain` | The domain whose site repo hosts this ad. |
+| `owner` | GitHub login owning the site repo. |
+| `capabilities` | Subset of `["site","collab","mail","drive"]` — what this peer will do over P2P. A capability absent means "ask GitHub, not me". |
+| `serves` | Domains this peer will serve bundles for. Always includes its own `domain`. Empty `[]` = serves nothing. |
+| `turn` | Optional. `{ "urls": [...] }` — TURN server URLs this peer can use, **without credentials**. Credentials are never published. Absent = no TURN configured. |
+| `updatedAt` | Unix ms the ad was published. |
+| `expiresAt` | Unix ms the ad stops being valid. Default: `updatedAt + 3,600,000` (1 hour). |
+
+- **Freshness rules:** a reader ignores an ad whose `expiresAt` is
+  in the past, whose `updatedAt` is more than 24 h in the future
+  (clock-skew guard), or whose `domain`/`owner` do not match the repo
+  it was fetched from. The client republishes its own ad every 15
+  minutes while P2P is enabled, and on every capability change.
+- **Discovery:** resolve the domain through the registry (§3) →
+  `owner` + site repo → `GET
+  https://raw.githubusercontent.com/<owner>/arknetz-site-<slug>/main/peer-ad.json`
+  (the existing raw-read path, ETag-cached in IndexedDB). A missing
+  ad (404) means "this user has no P2P" — not an error, just
+  GitHub-only.
+- **Authenticity:** the ad is trusted **because it came from the
+  user's own GitHub repo**, fetched over the same raw-read path as
+  their site document and their contacts entry. Repo write
+  permission *is* the authentication in v1 — exactly as it already
+  is for site content and the published mail public key. If someone
+  compromises a GitHub account they can publish a fake ad, exactly
+  as they could publish a fake site or a fake mail key; P2P adds no
+  new trust root. An ad fetched from any other repo, or with a
+  `domain`/`owner` that does not match the repo it came from, is
+  rejected. Future hardening (not v1): Ed25519-signed ads, with the
+  signing public key published in the contacts entry — deferred
+  deliberately, not forgotten (the mail key is X25519, agreement
+  only, so signing needs a second keypair).
+
+### 16.2 Signaling — sealed GitHub Issues
+
+There is no signaling server. Signaling messages travel as GitHub
+Issues in the recipient's `protocol-inbox` repo — the same repo, the
+same permissions, and the same Issue machinery as mail delivery
+(§6). Any authenticated user may open an Issue there; only the
+recipient can read the payload.
+
+- **Signal message (before sealing):** `{ v: 1, kind, signalId,
+  sessionId, fromPeerId, toPeerId, fromAddress, sdp?, candidate?,
+  sentAt }`. `kind` is one of `offer` | `answer` | `ice` | `bye`.
+  `offer`/`answer` carry `sdp` (a full `RTCSessionDescriptionInit`);
+  `ice` carries `candidate` (a single `RTCIceCandidateInit`); `bye`
+  carries neither. `signalId` is unique per message (dedupe key);
+  `sessionId` is unique per handshake.
+- **Sealing:** every signal message is sealed to the recipient
+  before it is posted — with the exact mail construction (fresh
+  AES-256-GCM CEK, wrapped to the recipient's X25519 mail public
+  key from the contacts directory). The Issue body carries the
+  sealed envelope in a ```` ```arknetz-signal ```` fenced block
+  (same fence convention as `arknetz-mail`); title
+  `ARKNETZ-SIGNAL <signalId>`, labels `["arknetz-signal"]`. This
+  matters because an SDP offer and its ICE candidates contain the
+  sender's IP addresses — posting those in cleartext in a public
+  Issue would publish both peers' IPs to the world. What stays
+  public: the Issue exists, its sender, its timestamp, its size.
+  What is hidden: the SDP, the ICE candidates, the peer IDs, the
+  session ID. A peer with no published mail public key **cannot be
+  signaled** — the handshake refuses before any Issue is created,
+  and the feature falls back to GitHub.
+- **Polling:** the recipient polls their own inbox for open
+  `arknetz-signal` Issues (the same list call as the mail inbox
+  pull, filtered by label) — every 30 s while P2P is enabled. After
+  a signal is processed its Issue is closed, so the inbox stays
+  near 0 KB. A signal that fails to decrypt is skipped and counted
+  — one bad Issue never blocks the rest.
+- **Handshake:** fetch ad → sealed `offer` → sealed `answer` → ICE
+  trickle both ways (sealed `ice` messages) → channel open →
+  `hello` both ways → CONNECTED. One `sessionId` per handshake; a
+  peer that receives an `offer` for a session it already has open
+  answers on the existing session instead of creating a second
+  connection (glare rule: the peer with the lexicographically
+  smaller `peerId` keeps the connection it initiated; the other
+  closes its duplicate). Max 8 concurrent connections (default);
+  the 9th handshake is refused with `bye` reason `too-many-peers`.
+  Handshake timeout 30 s → close, report `p2p-unreachable`, feature
+  falls back to GitHub.
+
+### 16.3 Transport — data channels and framing
+
+- **Channels:** one negotiated data channel per adapter
+  (`arknetz/<adapter>`, e.g. `arknetz/site`), over a real
+  `RTCPeerConnection` in the browser. Every message on a data
+  channel is one frame: `[ type: u8 ][ payload ]` — `0x01` = JSON
+  control message, `0x02` = chunk frame. The 16 KiB cap keeps every
+  `send()` under the SCTP message limit, so no frame is ever
+  fragmented by the channel itself.
+- **Control messages (type 0x01, JSON):** `hello` (`v`, `peerId`,
+  `features[]` — first message on a channel; a channel that does
+  not start with `hello` within 10 s is closed),
+  `transfer-begin` (`id`, `kind`, `totalBytes`, `totalChunks`,
+  `sha256`), `transfer-missing` (`id`, `indexes[]`),
+  `transfer-done` (`id`, `ok`, `reason?`), `op` (`session`,
+  `ops[]` — collab block ops), `cursor` (`session`, `login`,
+  `cursor`), `bye` (`reason?`). Unknown `t` values are ignored
+  (forward-compatible), never fatal.
+- **Chunked transfer (type 0x02):** `[ 0x02 ][ transferId: 16
+  bytes ][ index: u32 BE ][ data: up to 16 KiB ]`. Sender:
+  `transfer-begin` (with the SHA-256 of the whole payload), then
+  chunk frames in index order. Receiver collects chunks and on the
+  last index (or a 30 s transfer timeout) sends
+  `transfer-missing` for any gaps; up to 3 re-send rounds; then
+  verifies SHA-256 over the reassembled bytes. On match:
+  `transfer-done { ok: true }`. On mismatch after retries, or on
+  timeout: `transfer-done { ok: false, reason }` and the receiver
+  **discards the bytes** — a failed transfer never yields partial
+  data to a feature. Per-adapter caps, refused before the first
+  chunk: site bundle 25 MB, mail envelope 10 MB, drive chunk 10 MB
+  + 28 bytes GCM overhead, collab op batch 1 MB.
+- **Limits:** upload cap token bucket, default 512 KiB/s per peer
+  (0 = unlimited), payload bytes only; download uncapped (a peer
+  cannot force a download — every transfer is one the receiver
+  requested, except inbound mail/collab, capped by the per-adapter
+  size limits above). Max 8 concurrent peers, max 2 concurrent
+  transfers per peer. A peer that sends a malformed frame, an
+  oversized `transfer-begin`, or three failed verifications in a row
+  is disconnected and block-listed for the session (in-memory only;
+  a restart re-evaluates the peer from its fresh ad). Peer silence
+  (no frame on any channel for 60 s) marks the peer away; adapters
+  fall back; the connection is kept for 5 min, then closed.
+
+### 16.4 NAT traversal, STUN, and TURN
+
+- **The problem, honestly:** roughly a third of real-world peer
+  pairs need a relay (TURN) — both sides behind symmetric NATs,
+  carrier-grade NAT, or a corporate firewall. P2P in this app
+  **never silently falls back to a central relay**: if no direct
+  path exists and no TURN is configured, the connection fails and
+  the feature uses GitHub. That is a deliberate privacy and
+  architecture choice, not a bug to work around.
+- **STUN — always on, free, no account** (STUN only reveals an
+  address; it carries no traffic, relays nothing), in order:
+  `stun:stun.l.google.com:19302`, `stun1`–`stun4` on `:19302`
+  (Google, free, unmetered); `stun:stun.cloudflare.com:3478`;
+  `stun:openrelay.metered.ca:80`; `stun:stun.stunprotocol.org:3478`;
+  `stun:freeturn.net:3478`. Twilio STUN is **not** in the default
+  list — it could not be confirmed to answer without credentials.
+- **TURN — no-account fallbacks (Stanley, 2026-11-21 14:22):**
+  add ALL the ICE/TURN options that work WITHOUT creating any
+  account — no personal accounts of his used to create keys, no
+  signups in his name. TURN is a relay: when direct fails, both
+  peers' traffic flows through the TURN server, so the operator sees
+  both peers' IPs and traffic volume — **not content** (data
+  channels are DTLS-encrypted end to end). Fallback order when TURN
+  is enabled (per-user TURN first, then no-account fallbacks):
+  1. **Per-user TURN** (§16.4, below) — the user's own credentials,
+     if entered.
+  2. **freeturn.net** — `turn:freeturn.net:3478` and
+     `turns:freeturn.net:5349`, username `free`, credential `free`.
+     Free STUN+TURN, no account, no published quota, individually
+     operated. Labelled honestly: **community-run, no SLA, not a
+     production dependency.**
+  3. **Open Relay demo credential** — `turn:openrelay.metered.ca:80`
+     and `turns:openrelay.metered.ca:443`, username
+     `openrelayproject`, credential `openrelayproject` (the sample
+     credential published in Metered's own docs). Included **only as
+     an opt-in fallback behind a settings toggle**
+     (`useOpenRelayDemo`, off by default), labelled "community shared
+     credential — anyone can use it, quota is shared, may be
+     rate-limited or revoked". **Never the default, never presented
+     as private.** The toggle is inert unless the master TURN switch
+     is on.
+  - **Do NOT use Metered's public static-auth endpoint**
+    (`staticauth.openrelay.metered.ca`, secret
+    `"openrelayprojectsecret"`) as a default or a fallback. It is a
+    shared credential meant for self-hosted servers, not clients;
+    shipping it would be a shared master key by another name.
+  - **Why this does not break the no-shared-keys rule:** the
+    freeturn and demo credentials are not *our* keys — they are
+    public, published by their operators for anyone to use, with no
+    account behind them and no secret of Stanley's (or any user's)
+    involved. Nothing personal of Stanley's was used to create them.
+- **TURN — per-user credentials (bring your own key):** Metered Open
+  Relay 20 GB/month free (per-account API key; recommended per-user
+  option); Cloudflare Realtime TURN 1,000 GB/month free
+  (credentials API-issued, max 48 h validity; **unverified** whether
+  a free-plan account can create a TURN key without a card on file);
+  Xirsys 500 MB/month (too small); Twilio NTS no free TURN tier.
+  The per-user rule applies to TURN exactly as it applies to IA keys
+  and GitHub tokens: the app **never** bakes in a per-account TURN
+  credential — each user signs up for their own free account and
+  enters their own key in settings. TURN config shape:
+  `{ enabled, provider: "metered-openrelay" | "cloudflare" |
+  "custom" | "none", apiKey: string, urls: string[], useFreeTurn:
+  boolean, useOpenRelayDemo: boolean }` — all empty/off by default;
+  TURN stays off until the user turns it on.
+- **Verification status:** a STUN binding probe (RFC 5389) and a
+  TURN allocate probe (RFC 5766) were attempted from the build VM on
+  2026-11-21 — **no endpoint could be verified from that VM**
+  (UDP egress blocked, TCP reset by the egress proxy; the failure was
+  uniform across every endpoint including Google's STUN, proving the
+  block is local to the VM, not per-server). The credentials were
+  confirmed independently by web search from live sources. The real
+  verification is runtime ICE gathering + the diagnostics line on a
+  real device; if a server does not answer in the wild, the fallback
+  order simply moves to the next one.
+- **Settings UI note + connection diagnostics:** the settings UI
+  carries the relay privacy note verbatim (`P2P_RELAY_PRIVACY_NOTE`
+  in `src/lib/p2p/ice.ts`): "When a direct connection can't be made,
+  your traffic is relayed through the relay operator's servers. The
+  operator can see your IP address and how much you transfer, but not
+  what you send — P2P traffic is encrypted end to end, so the relay
+  cannot read it. Nothing is relayed unless you turn TURN on below."
+  And a connection-diagnostics line shows which ICE path succeeded
+  (`describeIcePath`): `direct (host)` / `direct (srflx)` /
+  `relayed via freeturn.net` / `relayed via openrelay.metered.ca
+  (demo credential)` / `relayed via your own TURN server` /
+  `loopback (test only)` / `unknown`. The relay operator is named,
+  never hidden.
+
+### 16.5 Feature wiring (phase 2)
+
+- **Settings:** per-device, IndexedDB (memory store in tests). All
+  off by default — master switch plus `sites`, `collab`, `mail`,
+  `drive`, `serveSites` separately; enabling the master switch does
+  **not** enable any feature. The P2P panel also carries peer-ID
+  rotation/reset (reset also wipes every setting + TURN key), the
+  TURN fields, the relay privacy note (§16.4), and the
+  connection-diagnostics line.
+- **Site reader:** try the peer first (`SiteSharing.fetchFromPeer`,
+  domain + optional expected SHA-256 verified), fall back to the CDN
+  on any failure, silently. A peer serves only sites in its ad's
+  `serves`, from bundles already in its reader cache — serving never
+  fetches from the CDN on someone else's behalf.
+- **Collab:** a `P2PCollabSession` runs alongside the relay poll;
+  local ops/cursors ride the data channel as well as the branch, and
+  remote P2P ops apply through the same LWW merge. While P2P is
+  connected the relay poll slows from 5 s to 30 s; the branch stays
+  the convergence safety net. A P2P session is accepted only for a
+  peer whose login is on the site's team (checked by the host before
+  connecting); a hook failure never breaks the relay join.
+- **Mail:** `sendDraft` seals once and delivers per recipient — P2P
+  first when the recipient is an online peer, otherwise the GitHub
+  inbox Issue (same `MailDelivery.deliver`). Inbound P2P envelopes
+  land in the normal inbox store, but only once a mail keypair
+  exists — until then the mail adapter is never attached, so no
+  envelope is ever acked and then lost. The host's signal poller
+  (30 s, part of its timers below) polls `arknetz-signal` Issues
+  and routes them to the peer manager; the mail panel's inbox
+  refresh separately pulls the GitHub inbox into the local store.
+- **ArkDrive:** a freshly uploaded chunk is offered to the user's
+  own online devices (same GitHub login, `drive` capability);
+  inbound chunks are decrypted + hash-verified locally and stored
+  in the vault (`importStoredChunk`) — the repo blobs stay the
+  durable copy, P2P only moves bytes faster. A chunk for a vault
+  this device holds no key for is refused before transfer.
+- **Timers (host):** signal poll 30 s, ad republish 15 min, silence
+  check 60 s. All start only once identity is configured and the
+  master switch is on.

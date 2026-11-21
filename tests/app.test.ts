@@ -10,8 +10,8 @@ const throwingFetch = (() => {
   throw new Error("no network in tests");
 }) as unknown as typeof fetch;
 
-test("app: all 15 panels are registered, ids unique, titles present", () => {
-  assert.equal(APP_PANELS.length, 15);
+test("app: all 16 panels are registered, ids unique, titles present", () => {
+  assert.equal(APP_PANELS.length, 16);
   const ids = APP_PANELS.map((p) => p.id);
   assert.equal(new Set(ids).size, ids.length);
   for (const p of APP_PANELS) {
@@ -19,7 +19,7 @@ test("app: all 15 panels are registered, ids unique, titles present", () => {
     assert.ok(p.description.length > 0, p.id);
     assert.ok(p.module.length > 0, p.id);
   }
-  for (const id of ["browse", "builder", "mail", "drive", "search", "comments", "streaming", "offline", "stats", "domains", "moderation", "accounts", "wayback", "backends", "settings"]) {
+  for (const id of ["browse", "builder", "mail", "drive", "search", "comments", "streaming", "offline", "stats", "domains", "moderation", "accounts", "wayback", "backends", "p2p", "settings"]) {
     assert.ok(panelById(id), `panel ${id} is registered`);
   }
   assert.equal(panelById("no-such-panel"), undefined);
@@ -27,7 +27,7 @@ test("app: all 15 panels are registered, ids unique, titles present", () => {
 
 test("app: createArkNetzApp constructs every phase service with no network", () => {
   const app = createArkNetzApp({ fetchFn: throwingFetch });
-  assert.equal(app.panels.length, 15);
+  assert.equal(app.panels.length, 16);
   assert.ok(app.mailDelivery);
   assert.ok(app.mailStore);
   assert.ok(app.draftStore);
@@ -40,7 +40,7 @@ test("app: createArkNetzApp constructs every phase service with no network", () 
   assert.ok(app.keyring);
   assert.equal(app.keyring.isUnlocked, false);
   const readiness = app.describeReadiness();
-  assert.equal(readiness.panels, 15);
+  assert.equal(readiness.panels, 16);
   assert.ok(readiness.signedInPanels > 0);
   assert.match(readiness.note, /real central repos/);
 });

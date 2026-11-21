@@ -8,7 +8,7 @@
 // before any central repo exists; it is labelled as a demo in the page.
 
 import { CachedFetcher, createIndexedDBStore, createMemoryCacheStore } from "./lib/cache.js";
-import { RegistryResolver } from "./lib/registry.js";
+import { RegistryResolver, siteZstUrl } from "./lib/registry.js";
 import { installArknetzLinkInterceptor, renderSiteDocument } from "./lib/renderer.js";
 import {
   AppSaveBridge,
@@ -51,6 +51,10 @@ import { EditorUI } from "./lib/editor-ui.js";
 import type { SiteDocument } from "./lib/types.js";
 import { createArkNetzApp } from "./lib/app.js";
 import type { ArkNetzApp } from "./lib/app.js";
+import { buildMailFromDraft } from "./lib/mail/compose.js";
+import type { MailDraft } from "./lib/mail/compose.js";
+import type { MailAddress, MailKeypair } from "./lib/mail/types.js";
+import type { VaultManager } from "./lib/drive/drive.js";
 import { installDeepLinkListener, isOAuthCallbackUrl } from "./lib/deep-link.js";
 import { scrollBelowTopbar } from "./lib/scroll.js";
 import { mountPanels } from "./lib/panels.js";
@@ -94,6 +98,14 @@ let githubLogin: string | null = null;
 /** The app object, once init() has built it — the sign-in completion
  *  (which can arrive via a deep link at any moment) needs the keyring. */
 let app: ArkNetzApp | null = null;
+/** Phase 2 P2P shell state: the mail keypair + address (from the
+ *  mail panel — the shell never invents them) and the open vault
+ *  (from the drive panel). syncP2PShell() runs whenever any of the
+ *  inputs lands; until sign-in + keypair are present the host stays
+ *  inert (all-off settings, no connections, no ads). */
+let mailKeypair: MailKeypair | null = null;
+let mailAddress = "";
+let openVault: VaultManager | null = null;
 /** The top-bar Account Switcher Pill (D6): created once the app
  *  object exists, re-rendered on every GitHub status refresh. */
 let accountPill: AccountPill | null = null;
@@ -148,6 +160,10 @@ function ensureEditorUi(): EditorUI {
       getSiteRepo: (domain: string) => siteRepoName(domain),
       githubFetch,
       htmlFetch,
+      // Phase 2 P2P: the editor joins the P2P collab channel
+      // alongside the relay when the app has a host and P2P collab
+      // is enabled; relay-only when this returns null.
+      getCollabP2PHook: (domain: string) => app?.getP2PCollabHook(domain) ?? null,
     });
   }
   return editorUi;
@@ -258,7 +274,18 @@ async function renderCurrent(): Promise<void> {
   }
   reader.innerHTML = `<p>Loading ${parsed.value}…</p>`;
   try {
-    const site = await resolver.loadSite(parsed.value);
+    // Phase 2 P2P: try a peer first, then the CDN. loadSiteViaPeer
+    // returns null whenever P2P cannot serve (off, unsigned, no
+    // peer, any failure) — the reader then loads from the CDN
+    // exactly as before, silently. A P2P failure never surfaces as
+    // a load error.
+    let peerSite: SiteDocument | null = null;
+    try {
+      peerSite = await app?.p2pHost.loadSiteViaPeer(parsed.value, (domain) => resolver.resolve(domain)) ?? null;
+    } catch {
+      peerSite = null;
+    }
+    const site = peerSite ?? (await resolver.loadSite(parsed.value));
     const page = sitePageForPath(site, parsed.path);
     currentDoc = cloneDoc(page);
     // The registry entry knows the site repo's owner — collab join
@@ -358,6 +385,102 @@ function refreshGithubStatus(): void {
     ? `GitHub: signed in as ${githubLogin ?? "unknown"} — Publish can run.`
     : "GitHub: not signed in. Publish needs sign-in (and a GitHub OAuth App must exist first).";
   renderAccountPill();
+}
+
+/** Phase 2 P2P shell sync: wire the host's identity, mail handler,
+ *  and drive sink from whatever the shell knows so far. Safe to call
+ *  after every input lands (sign-in, keypair creation, vault open)
+ *  and at init. Each half is independent:
+ *  - identity needs sign-in + a mail keypair (the private key opens
+ *    sealed signal Issues; the address is the peer ad's address).
+ *    Until both exist the host stays inert — no connections, no ads.
+ *  - the drive sink needs only an open vault (chunk receipt is
+ *    independent of mail identity).
+ *  The host's own timers (signal poll 30 s, ad republish 15 min,
+ *  silence check 60 s) start once identity + the master switch are
+ *  on; the shell never runs a second poller. */
+function syncP2PShell(): void {
+  if (!app) return;
+  const host = app.p2pHost;
+  if (githubToken && githubLogin && mailKeypair && mailAddress) {
+    host.configureIdentity({
+      address: mailAddress as MailAddress,
+      githubLogin,
+      token: githubToken,
+      privateKey: mailKeypair.privateKey,
+    });
+    // Inbound P2P envelopes land in the normal inbox path (the same
+    // store the mail panel reads). The handler is only set once a
+    // keypair exists — until then the mail adapter is never attached,
+    // so no envelope is ever acked and then lost.
+    host.setMailEnvelopeHandler(async (envelope) => {
+      if (!mailKeypair || !app) return;
+      const inbox = app.openInbox(mailKeypair);
+      await inbox.receive(envelope);
+    });
+  } else {
+    host.setMailEnvelopeHandler(null);
+  }
+  if (openVault?.vaultId) {
+    host.setKnownVaultIds(new Set([openVault.vaultId]));
+    host.setDriveChunkSink(async (chunk) => {
+      if (!openVault || openVault.vaultId !== chunk.vaultId) return;
+      await openVault.importStoredChunk(chunk.vaultId, chunk.blobId, chunk.bytes);
+    });
+  } else {
+    host.setKnownVaultIds(new Set());
+    host.setDriveChunkSink(null);
+  }
+  host.start();
+}
+
+/** Send a sealed protocol-mail draft (the mail panel's Send button).
+ *  P2P first, GitHub inbox fallback — the host seals once and
+ *  delivers per recipient. When the host cannot send (no identity
+ *  configured — e.g. the keypair predates this session's sign-in),
+ *  the shell seals the same draft itself and delivers straight to
+ *  each recipient's GitHub inbox, so a send never fails for a P2P
+ *  reason. Not signed in → exact refusal, zero GitHub calls. */
+async function sendProtocolMail(
+  draft: MailDraft,
+  keypair: MailKeypair,
+): Promise<{ ok: boolean; message: string }> {
+  if (!app) return { ok: false, message: "The app is not ready yet — try again in a moment." };
+  if (!githubToken || !githubLogin) {
+    return { ok: false, message: "Sign in with GitHub first to send mail." };
+  }
+  const host = app.p2pHost;
+  try {
+    const result = await host.sendDraft(draft, keypair);
+    const viaP2p = result.p2p.length;
+    const viaGithub = result.github.length;
+    const parts: string[] = [];
+    if (viaP2p) parts.push(`${viaP2p} delivered direct over P2P`);
+    if (viaGithub) parts.push(`${viaGithub} delivered to the GitHub inbox`);
+    return { ok: true, message: `Sent. ${parts.join("; ") || "No recipients?"}.` };
+  } catch (err) {
+    // The host path needs identity; fall back to the plain GitHub
+    // inbox delivery with the same sealed envelope.
+    if (!(err instanceof Error) || !/identity/i.test(err.message)) {
+      return { ok: false, message: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  try {
+    const envelope = await buildMailFromDraft(draft, keypair, (address) =>
+      host.resolveContact(address).then((entry) => entry ?? undefined),
+    );
+    const sent: string[] = [];
+    for (const address of [...draft.to, ...draft.cc, ...draft.bcc]) {
+      const contact = await host.resolveContact(address);
+      const githubUser =
+        contact?.githubUser ?? (await resolver.resolve(address.split("@")[1] as string)).owner;
+      await app.mailDelivery.deliver(envelope, githubUser, githubToken);
+      sent.push(address);
+    }
+    return { ok: true, message: `Sent to the GitHub inbox (${sent.length} recipient${sent.length === 1 ? "" : "s"}) — P2P was not available for this send.` };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /** Build the Account Switcher Pill once, re-render it on every
@@ -536,6 +659,7 @@ async function startGitHubSignIn(): Promise<void> {
     const { user } = await completeDeviceSignIn(token);
     githubToken = token;
     githubLogin = user.login;
+    syncP2PShell();
     if (app?.keyring.isUnlocked) {
       await addGithubAccount(app.keyring, user, token);
       showStatus(`Signed in with GitHub as ${user.login} — account saved in the keyring.`);
@@ -582,6 +706,7 @@ async function completeGitHubSignIn(callbackUrl: string): Promise<void> {
     const { token, user } = await completeOAuthCallback(callbackUrl, expectedState);
     githubToken = token;
     githubLogin = user.login;
+    syncP2PShell();
     if (app?.keyring.isUnlocked) {
       await addGithubAccount(app.keyring, user, token);
       showStatus(`Signed in with GitHub as ${user.login} — account saved in the keyring.`);
@@ -701,6 +826,9 @@ function handleSiteOpened(opened: OpenedSite): void {
   // The claim record knows the site repo's owner (the claimer) —
   // collab join addresses that repo.
   currentSiteOwner = opened.registryEntry.owner;
+  // Phase 2 P2P: the claimed domain is now one of my own — the peer
+  // ad publishes it (serves) once P2P is on and identity is set.
+  void app?.p2pHost.addOwnDomain(opened.domain).catch(() => undefined);
   const ui = ensureEditorUi();
   ($("reader") as HTMLElement).hidden = true;
   ui.showSiteOpened(opened);
@@ -762,7 +890,25 @@ async function init(): Promise<void> {
   const appInstance = createArkNetzApp();
   app = appInstance;
   await appInstance.loadTelemetrySettings();
+  await appInstance.loadP2PSettings();
   await appInstance.keyring.load();
+  // Phase 2 P2P shell wiring: the host resolves registry entries
+  // through the shell's resolver, and serves sites from the
+  // reader's ETag cache (a bundle already fetched stays servable;
+  // serving never fetches from the CDN on someone else's behalf).
+  // The host's own timers start once identity + the master switch
+  // are on (syncP2PShell, called on sign-in / keypair / vault).
+  appInstance.p2pHost.setRegistryResolver((domain) => resolver.resolve(domain));
+  appInstance.p2pHost.setCachedBundleProvider(async (domain) => {
+    try {
+      const entry = await resolver.resolve(domain);
+      const { bytes } = await fetcher.fetchBytes(siteZstUrl(entry));
+      return bytes;
+    } catch {
+      return null;
+    }
+  });
+  syncP2PShell();
 
   // OS deep links (arknetz://…): the Tauri deep-link plugin delivers
   // them via window.__TAURI__.deepLink when the app runs in the shell
@@ -810,6 +956,17 @@ async function init(): Promise<void> {
   const panels = mountPanels(appInstance, $("panel-nav"), $("panel-host"), {
     getCurrentDoc: () => currentDoc,
     getGithubLogin: () => githubLogin,
+    getGithubToken: () => githubToken,
+    onSendMail: (draft, keypair) => sendProtocolMail(draft, keypair),
+    onMailKeypair: (keypair, address) => {
+      mailKeypair = keypair;
+      mailAddress = address;
+      syncP2PShell();
+    },
+    onVaultOpened: (vault) => {
+      openVault = vault;
+      syncP2PShell();
+    },
     getSiteStats: () => appInstance.getSiteStats(currentDoc.domain),
     getTelemetrySettings: () => appInstance.getTelemetrySettings(),
     setTelemetrySettings: (next) => appInstance.setTelemetrySettings(next),

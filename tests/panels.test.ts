@@ -20,7 +20,7 @@ const opts = {
   fetchFn: throwingFetch,
 };
 
-test("panels: all 15 registered panels render a titled section", async () => {
+test("panels: all 16 registered panels render a titled section", async () => {
   const app = createArkNetzApp({ fetchFn: throwingFetch });
   const state = createPanelState();
   for (const panel of APP_PANELS) {
@@ -51,7 +51,12 @@ test("panels: mail with a generated keypair shows the real (empty) inbox + compo
   const html = await renderPanelHtml(app, "mail", state, opts);
   assert.match(html, /alice@computers\.edu/);
   assert.match(html, /Compose/);
-  assert.match(html, /Drafts are real and saved locally/);
+  // Phase 2: the old "sending stays disabled" copy is gone — compose has
+  // a real Send button and the note describes P2P-first delivery with the
+  // GitHub inbox as fallback; drafts still save locally.
+  assert.match(html, /an-mail-send-btn/);
+  assert.match(html, /straight to the recipient when they are an online peer/);
+  assert.match(html, /draft saved locally/);
 });
 
 test("panels: drive shows the honest limits and the backend picker", async () => {
@@ -149,10 +154,10 @@ test("panels: moderation nav button hidden for guests and non-masters, shown for
   assert.equal(panelVisibleForLogin(moderation, MASTER_GITHUB_USER), true);
   assert.equal(MASTER_GITHUB_USER, "PropTheRtRevDrSirStanleyG05");
   const guestVisible = visiblePanelsForLogin(APP_PANELS, null);
-  assert.equal(guestVisible.length, 14);
+  assert.equal(guestVisible.length, 15);
   assert.equal(guestVisible.some((p) => p.id === "moderation"), false);
   const masterVisible = visiblePanelsForLogin(APP_PANELS, MASTER_GITHUB_USER);
-  assert.equal(masterVisible.length, 15);
+  assert.equal(masterVisible.length, 16);
   assert.equal(masterVisible.some((p) => p.id === "moderation"), true);
   // Every other panel stays visible to guests — guest browsing is the
   // default and hiding moderation must not hide anything else.

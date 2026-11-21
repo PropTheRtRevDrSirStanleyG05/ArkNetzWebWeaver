@@ -37,6 +37,13 @@ import { createMemoryPingStore, createIndexedDBTelemetrySettingsStore, createMem
 import type { SiteStats, TelemetrySettings, TelemetrySettingsStore } from "./viewer/stats.js";
 import { createMemoryMyListStore, createMemoryProgressStore } from "./viewer/streaming.js";
 import type { DraftStore } from "./mail/compose.js";
+import { P2PHost } from "./p2p/host.js";
+import { createIndexedDBP2PStore, createMemoryP2PStore } from "./p2p/store.js";
+import type { P2PSettings } from "./p2p/types.js";
+import { defaultP2PSettings } from "./p2p/types.js";
+import type { P2PPeerInfo } from "./p2p/host.js";
+import type { P2PPeerRow } from "./p2p/panel.js";
+import type { CollabP2PHook } from "./collab/session.js";
 import type { SearchIndexStore } from "./viewer/search.js";
 import type { ViewPingStore } from "./viewer/stats.js";
 import type { MyListStore, ProgressStore } from "./viewer/streaming.js";
@@ -71,6 +78,7 @@ export const APP_PANELS: readonly AppPanel[] = [
   { id: "accounts", title: "Accounts", description: "Switch accounts across every backend, per-site auto-binding, Root Registries.", module: "network/accounts", needsSignIn: false },
   { id: "wayback", title: "Time Machine", description: "Snapshot a site to the Wayback Machine and browse its history.", module: "network/wayback", needsSignIn: true },
   { id: "backends", title: "Backends", description: "Every storage backend ArkNetz can read and write — linked accounts, mirror failover, and ToS-aware upload routing.", module: "network/backends", needsSignIn: false },
+  { id: "p2p", title: "P2P", description: "Optional peer-to-peer transport — faster site loads, live collab, mail and drive between your devices. Off by default; GitHub stays the fallback.", module: "p2p", needsSignIn: false },
   { id: "settings", title: "Settings", description: "IA account linking, telemetry (Strict Offline mode), ToS acceptance, backends.", module: "network/tos", needsSignIn: false },
 ];
 
@@ -173,6 +181,33 @@ export interface ArkNetzApp {
   pooledDrive: (vaults: PooledVault[]) => PooledDrive;
   /** True once a vault/account is usable; the shell uses this to decide which panels are live. */
   describeReadiness: () => { panels: number; signedInPanels: number; note: string };
+  /** P2P host (phase 2): owns settings persistence, the peer
+   *  manager, signaling, and the per-feature adapters. The shell
+   *  wires identity (sign-in) and the registry resolver after
+   *  construction; the host is inert (all-off) until then. */
+  p2pHost: P2PHost;
+  /** Current P2P settings (synchronous copy of the host's mirror). */
+  getP2PSettings: () => P2PSettings;
+  /** Update the P2P settings (persisted by the host's store). */
+  setP2PSettings: (next: P2PSettings) => void;
+  /** Re-read the persisted P2P settings + peer id into the host
+   *  (call once at startup, before the P2P panel mounts). */
+  loadP2PSettings: () => Promise<P2PSettings>;
+  /** This device's peer id. */
+  getP2PPeerId: () => string;
+  /** Rotate the peer id (old id stops being advertised). */
+  rotateP2PPeerId: () => Promise<string>;
+  /** Reset the peer id and clear every P2P setting + TURN key. */
+  resetP2PPeerId: () => Promise<string>;
+  /** Currently connected peers with their diagnostics summaries. */
+  getP2PConnectedPeers: () => Promise<P2PPeerRow[]>;
+  /** ICE servers in effect right now (STUN always, TURN when on). */
+  getP2PIceServers: () => string[];
+  /** This device's protocol address, when the host knows one. */
+  getP2PSelfAddress: () => string | null;
+  /** The P2P collab hook for a domain, or null when P2P collab is
+   *  off — the editor then runs relay-only. */
+  getP2PCollabHook: (domain: string) => CollabP2PHook | null;
 }
 
 /** Construct every phase service with shared stores. No network is used. */
@@ -208,6 +243,19 @@ export function createArkNetzApp(options: ArkNetzAppOptions = {}): ArkNetzApp {
   const progressStore = createMemoryProgressStore();
   const myListStore = createMemoryMyListStore();
   const keyring = new AccountKeyring(keyringStore, options.masterGithubUser);
+
+  // P2P host (phase 2): per-device settings in IndexedDB when the
+  // app runs with it, memory otherwise. The shell wires identity
+  // (configureIdentity after sign-in) and the registry resolver
+  // (setRegistryResolver) — until then the host is inert: all-off
+  // settings, no connections, no ads. The raw fetch is the plain
+  // global fetch (peer ads + contacts shards are public raw CDN
+  // reads); the API fetch is the app's bound fetch.
+  const p2pHost = new P2PHost({
+    settingsStore: useIdb ? createIndexedDBP2PStore() : createMemoryP2PStore(),
+    apiFetch: fetchFn,
+    rawFetch: (...args: [input: RequestInfo | URL, init?: RequestInit]) => globalThis.fetch(...args),
+  });
 
   // Provider -> backend prefix for the Backends panel's `linked` map.
   // accounts.ts already owns PROVIDER_PREFIX (provider -> "gh:" etc.);
@@ -266,9 +314,42 @@ export function createArkNetzApp(options: ArkNetzAppOptions = {}): ArkNetzApp {
         token,
         fetchFn: fetchFn as unknown as DriveHttpFetch,
       });
-      return new VaultManager(backend, client);
+      // Phase 2 P2P: a freshly uploaded chunk is offered to the
+      // user's own online devices (best-effort; the repo blob is
+      // the durable copy). The hook never throws into the upload.
+      return new VaultManager(backend, client, {
+        onChunkUploaded: (vaultId, blobId, storedBytes) => {
+          void p2pHost.pushDriveChunk(vaultId, blobId, storedBytes).catch(() => undefined);
+        },
+      });
     },
     pooledDrive: (vaults) => new PooledDrive(vaults),
+    p2pHost,
+    getP2PSettings: () => p2pHost.getSettings(),
+    setP2PSettings: (next) => p2pHost.setSettings(next),
+    loadP2PSettings: async () => {
+      const state = await p2pHost.load();
+      return { ...state.settings, turn: { ...state.settings.turn } };
+    },
+    getP2PPeerId: () => p2pHost.getPeerId(),
+    rotateP2PPeerId: () => p2pHost.rotatePeerId(),
+    resetP2PPeerId: () => p2pHost.resetPeerId(),
+    getP2PConnectedPeers: async () => {
+      const peers: P2PPeerInfo[] = await p2pHost.connectedPeers();
+      return peers.map((peer) => ({
+        peerId: peer.peerId,
+        address: peer.address,
+        diagnostics: peer.diagnostics,
+      }));
+    },
+    getP2PIceServers: () =>
+      p2pHost.iceServersInEffect().sources.map((source) => source.label),
+    getP2PSelfAddress: () => p2pHost.selfAddress,
+    getP2PCollabHook: (domain) => {
+      const settings = p2pHost.getSettings();
+      if (!settings.enabled || !settings.collab) return null;
+      return p2pHost.createCollabHook(domain);
+    },
     describeReadiness: () => ({
       panels: APP_PANELS.length,
       signedInPanels: APP_PANELS.filter((p) => p.needsSignIn).length,

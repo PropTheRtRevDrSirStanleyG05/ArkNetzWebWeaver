@@ -1,4 +1,4 @@
-// Panels — mounts the 15 phase panels into the shell.
+// Panels — mounts the 16 phase panels into the shell.
 // This is the single integration hook for phases 1–4: the app is
 // constructed once (createArkNetzApp) and every panel renders from the
 // real phase services, not from placeholders. Where a panel needs a
@@ -26,11 +26,14 @@ import {
   streamingViewModel,
 } from "./viewer/viewer2-ui.js";
 import { renderStatsPanelHtml, mountStatsPanel } from "./viewer/stats-panel.js";
+import { renderP2PPanelHtml, mountP2PPanel } from "./p2p/panel.js";
+import type { P2PPanelDeps } from "./p2p/panel.js";
 import { defaultTelemetrySettings, emptyStats } from "./viewer/stats.js";
 import type { SiteStats, TelemetrySettings } from "./viewer/stats.js";
 import { bundleSummary, packSiteOffline } from "./viewer/offline.js";
 import { buildNewlyUpdatedFeed, buildTrendingFeed } from "./viewer/search.js";
 import { newDraft, saveDraft, validateDraft, validateMailAddress } from "./mail/compose.js";
+import type { MailDraft } from "./mail/compose.js";
 import type { MailKeypair } from "./mail/types.js";
 import { inboxViewModel, MAIL_NO_KEY_COPY, MAIL_ONLY_PROTOCOL_NOTICE } from "./mail/mail-ui.js";
 import { bindDriveDropZone, DropUploadTracker, DROP_ZONE_COPY, fileListView, HONEST_LIMITS_COPY, quotaView } from "./drive/drive-ui.js";
@@ -48,6 +51,21 @@ export interface PanelHostOptions {
    *  decide whether the Moderation nav button is shown (P5: hidden
    *  unless the active account is the Root Master). Defaults to guest. */
   getGithubLogin?: () => string | null | undefined;
+  /** The signed-in user's own GitHub OAuth token (mail inbox poll +
+   *  send). Null = not signed in. */
+  getGithubToken?: () => string | null | undefined;
+  /** Mail panel: send a sealed draft. The shell owns the send
+   *  (P2P first, GitHub inbox fallback) and returns the plain-
+   *  language outcome for the status line. Absent in tests — the
+   *  Send button then says so. */
+  onSendMail?: (draft: MailDraft, keypair: MailKeypair) => Promise<{ ok: boolean; message: string }>;
+  /** Mail panel: a keypair was just created (or cleared) — the shell
+   *  uses it to configure the P2P identity + inbound envelope
+   *  handler. */
+  onMailKeypair?: (keypair: MailKeypair | null, address: string) => void;
+  /** Drive panel: a vault was just opened (or closed) — the shell
+   *  uses it to wire the P2P drive-chunk sink + known vault ids. */
+  onVaultOpened?: (vault: VaultManager | null) => void;
   /** Called synchronously on every panel switch, after the reader /
    *  editor toggle: the shell uses it to hide the main layout (reader
    *  + sidebar + editor) while a non-browse, non-builder panel is
@@ -142,6 +160,21 @@ function backendsDeps(opts: PanelHostOptions): {
   };
 }
 
+/** P2P deps from ONE source: renderPanelHtml() and wirePanel() must
+ *  read the same settings/peer id, or the toggles re-render stale
+ *  values. Connected peers are read fresh on every render (an async
+ *  diagnostics call) — a peer that connected since the last render
+ *  shows up on the next panel switch. */
+async function p2pDeps(app: ArkNetzApp): Promise<P2PPanelDeps> {
+  return {
+    settings: app.getP2PSettings(),
+    peerId: app.getP2PPeerId(),
+    selfAddress: app.getP2PSelfAddress(),
+    connectedPeers: await app.getP2PConnectedPeers().catch(() => []),
+    iceServersInEffect: app.getP2PIceServers(),
+  };
+}
+
 /** Render one panel to HTML from the live app services. No DOM needed. */
 export async function renderPanelHtml(
   app: ArkNetzApp,
@@ -175,15 +208,16 @@ export async function renderPanelHtml(
       return (
         h +
         note(`Signed in to protocol mail as ${state.mailAddress}. ${MAIL_ONLY_PROTOCOL_NOTICE}`) +
-        section("Inbox", vm.totalCount === 0 ? `<p>${esc(vm.emptyCopy)}</p>` : `<ul>${vm.rows.map((r) => `<li><strong>${esc(r.subject)}</strong> — ${esc(r.from)} · ${esc(r.snippet)}</li>`).join("")}</ul><p>${vm.unreadCount} unread.</p>`) +
+        section("Inbox", `<p><button id="an-mail-refresh-btn" type="button">Refresh inbox</button></p><div id="an-mail-refresh-status" role="status"></div>` + (vm.totalCount === 0 ? `<p>${esc(vm.emptyCopy)}</p>` : `<ul>${vm.rows.map((r) => `<li><strong>${esc(r.subject)}</strong> — ${esc(r.from)} · ${esc(r.snippet)}</li>`).join("")}</ul><p>${vm.unreadCount} unread.</p>`)) +
         section(
           "Compose (draft saved locally)",
           `<label>To <input id="an-mail-to" type="text" placeholder="friend@computers.edu"></label>
            <label>Subject <input id="an-mail-subject" type="text"></label>
            <label>Body <textarea id="an-mail-body" rows="4"></textarea></label>
            <button id="an-mail-draft-btn" type="button">Save draft</button>
+           <button id="an-mail-send-btn" type="button">Send</button>
            <div id="an-mail-draft-status" role="status"></div>
-           <p class="an-note">Sending needs the recipient's public key from the contacts directory and a signed-in GitHub account — the contacts directory has no entries yet, so sending stays disabled until then. Drafts are real and saved locally now.</p>`,
+           <p class="an-note">Send seals the draft with the recipient's public key from the contacts directory and delivers it — straight to the recipient when they are an online peer, otherwise to their GitHub inbox. Sending needs a signed-in GitHub account; without one the button refuses and the draft still saves locally.</p>`,
         )
       );
     }
@@ -331,6 +365,10 @@ export async function renderPanelHtml(
       // renderBackendsPanelHtml carries its own <h2>Backends</h2>.
       return renderBackendsPanelHtml(backendsDeps(opts));
     }
+    case "p2p": {
+      // renderP2PPanelHtml carries its own <h2>P2P</h2>.
+      return renderP2PPanelHtml(await p2pDeps(app));
+    }
     case "settings":
       return h + note("Internet Archive and GitHub settings live in the sidebar on the left — link IA keys there to enable stealth upload, and sign in with GitHub to enable Publish.");
     default:
@@ -339,14 +377,14 @@ export async function renderPanelHtml(
 }
 
 /** Wire a rendered panel's buttons. Called by mountPanels after render. */
-export function wirePanel(
+export async function wirePanel(
   root: HTMLElement,
   app: ArkNetzApp,
   panelId: string,
   state: PanelState,
   opts: PanelHostOptions,
   rerender: () => void,
-): void {
+): Promise<void> {
   const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const $ = (id: string) => root.querySelector<HTMLElement>(`#${id}`);
   const download = opts.download ?? ((blob: Blob, filename: string) => {
@@ -369,6 +407,7 @@ export function wirePanel(
       void app.newMailKeypair(addr).then((kp) => {
         state.mailKeypair = kp;
         state.mailAddress = addr;
+        opts.onMailKeypair?.(kp, addr);
         rerender();
       }).catch((e) => {
         if (status) status.textContent = e instanceof Error ? e.message : String(e);
@@ -376,6 +415,35 @@ export function wirePanel(
     });
   }
   if (panelId === "mail" && state.mailKeypair) {
+    // Inbox refresh: pull the GitHub inbox (Issue inbox) into the
+    // local store, then re-render. The P2P signal poll lives in the
+    // shell (it needs no keypair); this is the GitHub half, and it
+    // needs the keypair that lives in this panel's state.
+    $("an-mail-refresh-btn")?.addEventListener("click", () => {
+      const status = $("an-mail-refresh-status");
+      const login = opts.getGithubLogin?.();
+      const token = opts.getGithubToken?.();
+      if (!login || !token) {
+        if (status) status.textContent = "Sign in with GitHub first to refresh the inbox.";
+        return;
+      }
+      const keypair = state.mailKeypair;
+      if (!keypair) return;
+      if (status) status.textContent = "Refreshing inbox…";
+      void app.mailDelivery
+        .pollInbox(login, token)
+        .then(async ({ pulled }) => {
+          const inbox = app.openInbox(keypair);
+          for (const item of pulled) {
+            if (item.envelope) await inbox.receive(item.envelope, item.issueNumber);
+          }
+          if (status) status.textContent = pulled.length ? `${pulled.length} new message${pulled.length === 1 ? "" : "s"} pulled from the GitHub inbox.` : "Inbox is up to date — nothing new.";
+          rerender();
+        })
+        .catch((e) => {
+          if (status) status.textContent = e instanceof Error ? e.message : String(e);
+        });
+    });
     $("an-mail-draft-btn")?.addEventListener("click", () => {
       const to = ($("an-mail-to") as HTMLInputElement | null)?.value.trim() ?? "";
       const subject = ($("an-mail-subject") as HTMLInputElement | null)?.value ?? "";
@@ -392,6 +460,36 @@ export function wirePanel(
       }).catch((e) => {
         if (status) status.textContent = e instanceof Error ? e.message : String(e);
       });
+    });
+    // Send: seal + deliver through the shell (P2P first, GitHub
+    // inbox fallback). The button refuses plainly without sign-in
+    // instead of pretending to send.
+    $("an-mail-send-btn")?.addEventListener("click", () => {
+      const to = ($("an-mail-to") as HTMLInputElement | null)?.value.trim() ?? "";
+      const subject = ($("an-mail-subject") as HTMLInputElement | null)?.value ?? "";
+      const body = ($("an-mail-body") as HTMLTextAreaElement | null)?.value ?? "";
+      const status = $("an-mail-draft-status");
+      const draft: MailDraft = { ...newDraft(state.mailAddress), to: [to], subject, body };
+      const problems = validateDraft(draft);
+      if (problems.length) {
+        if (status) status.textContent = problems.join(" ");
+        return;
+      }
+      const keypair = state.mailKeypair;
+      if (!keypair) return;
+      if (!opts.onSendMail) {
+        if (status) status.textContent = "Sending is not wired in this build — the draft is saved locally instead.";
+        return;
+      }
+      if (status) status.textContent = "Sending…";
+      void opts
+        .onSendMail(draft, keypair)
+        .then((result) => {
+          if (status) status.textContent = result.message;
+        })
+        .catch((e) => {
+          if (status) status.textContent = e instanceof Error ? e.message : String(e);
+        });
     });
   }
   if (panelId === "drive") {
@@ -418,6 +516,7 @@ export function wirePanel(
         void vault.open(pass).then(async () => {
           state.vaultLabel = `${backend}:${repo}`;
           state.vault = vault;
+          opts.onVaultOpened?.(vault);
           try {
             state.vaultFiles = await vault.listFolder(null);
           } catch {
@@ -593,6 +692,19 @@ export function wirePanel(
   if (panelId === "backends") {
     mountBackendsPanel(root, backendsDeps(opts));
   }
+  if (panelId === "p2p") {
+    const deps = await p2pDeps(app);
+    mountP2PPanel(root, {
+      ...deps,
+      onSettingsChange: (next) => app.setP2PSettings(next),
+      onRotatePeerId: () => {
+        void app.rotateP2PPeerId().catch(() => undefined);
+      },
+      onResetPeerId: () => {
+        void app.resetP2PPeerId().catch(() => undefined);
+      },
+    });
+  }
 }
 
 /** Mount the panel nav + host into the shell. The nav shows only the
@@ -626,7 +738,7 @@ export function mountPanels(
     opts.onPanelShown?.(panelId);
     void renderPanelHtml(app, panelId, state, opts).then((html) => {
       host.innerHTML = html;
-      wirePanel(host, app, panelId, state, opts, () => showPanel(active));
+      void wirePanel(host, app, panelId, state, opts, () => showPanel(active));
     });
   };
   const buildNav = (): void => {

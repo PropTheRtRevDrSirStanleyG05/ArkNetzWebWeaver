@@ -12,6 +12,7 @@
 import { compressBytes, decompressBytes } from "../zstd.js";
 import {
   ARGON2ID_DEFAULT_PARAMS,
+  decryptBytes,
   decryptName,
   decryptVaultEnvelope,
   deriveVaultKeyArgon2id,
@@ -49,6 +50,17 @@ export class VaultNotOpenError extends Error {
     super("vault is not open — call open(passphrase) first");
     this.name = "VaultNotOpenError";
   }
+}
+
+/** Optional hooks the app shell wires (phase 2 P2P). All no-ops when
+ *  absent — the vault works exactly as before. */
+export interface VaultManagerHooks {
+  /** A NEW chunk blob was just uploaded (deduped chunks do not
+   *  fire — the peer already has those bytes, or the repo does).
+   *  `storedBytes` are the exact packed bytes (`iv | ciphertext`)
+   *  that went into the repo blob, ready for DriveP2P.sendChunk.
+   *  The hook must never throw into the upload path. */
+  onChunkUploaded?: (vaultId: string, blobId: string, storedBytes: Uint8Array) => void;
 }
 
 export interface UploadResult {
@@ -123,6 +135,7 @@ export function splitDroppedPath(path: string): { folders: string[]; name: strin
 export class VaultManager {
   readonly backend: VaultBackend;
   private readonly client: VaultBackendClient;
+  private readonly hooks?: VaultManagerHooks;
   private key: CryptoKey | null = null;
   private salt: Uint8Array | null = null;
   private manifest: VaultManifest | null = null;
@@ -135,13 +148,20 @@ export class VaultManager {
    *  silently changes the parameters. */
   private argonParams: Argon2idParams = ARGON2ID_DEFAULT_PARAMS;
 
-  constructor(backend: VaultBackend, client: VaultBackendClient) {
+  constructor(backend: VaultBackend, client: VaultBackendClient, hooks?: VaultManagerHooks) {
     this.backend = backend;
     this.client = client;
+    this.hooks = hooks;
   }
 
   get isOpen(): boolean {
     return this.key !== null && this.manifest !== null;
+  }
+
+  /** Id of the open vault (the DriveP2P known-vaults check). Null
+   *  when closed. */
+  get vaultId(): string | null {
+    return this.manifest?.vaultId ?? null;
   }
 
   /** KDF of the currently open vault ("argon2id" for every vault
@@ -463,7 +483,16 @@ export class VaultManager {
           continue;
         }
         const encrypted = await encryptChunk(key, chunk);
-        await this.client.putBlob(blobPath(encrypted.blobId), packStoredChunk(encrypted.iv, encrypted.encrypted));
+        const stored = packStoredChunk(encrypted.iv, encrypted.encrypted);
+        await this.client.putBlob(blobPath(encrypted.blobId), stored);
+        // Phase 2 P2P: offer the fresh chunk to own online devices.
+        // A hook failure must never fail the upload — the repo blob
+        // is the durable copy and the transfer is best-effort.
+        try {
+          this.hooks?.onChunkUploaded?.(manifest.vaultId, encrypted.blobId, stored);
+        } catch {
+          // Best-effort only.
+        }
         manifest.chunks[chunk.hash] = {
           blobId: encrypted.blobId,
           size: chunk.plaintext.length,
@@ -623,6 +652,55 @@ export class VaultManager {
       }
     }
     return results;
+  }
+
+  /** Import one chunk that arrived over P2P (phase 2). The bytes are
+   *  the packed stored form (`iv | ciphertext`) from
+   *  `packStoredChunk`, already SHA-256-verified on the wire by
+   *  DriveP2P. This method verifies them again locally: the vault
+   *  id must match the open vault, the bytes must decrypt under
+   *  this vault's key (AES-GCM authentication — a chunk for another
+   *  vault, or a tampered one, fails here), and the plaintext hash
+   *  becomes the manifest key. The blob is written to the repo
+   *  (skipped when already there) and recorded in the in-memory
+   *  manifest so a later upload of the same file dedups instead of
+   *  re-uploading; the manifest itself is NOT saved here — it stays
+   *  the repo's durable copy and syncs through the normal path.
+   *  Returns the chunk hash and whether the blob was new. */
+  async importStoredChunk(
+    vaultId: string,
+    blobId: string,
+    storedBytes: Uint8Array,
+  ): Promise<{ hash: string; stored: boolean }> {
+    const { key, manifest } = this.requireOpen();
+    if (vaultId !== manifest.vaultId) {
+      throw new Error("chunk is for a different vault — refused");
+    }
+    if (storedBytes.length < 12) {
+      throw new Error("chunk is too short to hold an AES-GCM iv — refused");
+    }
+    const iv = storedBytes.slice(0, 12);
+    const ciphertext = storedBytes.slice(12);
+    // AES-GCM authentication fails here for a wrong key or tampered
+    // bytes — the chunk never reaches the repo unverified.
+    const plain = await decryptBytes(key, iv, ciphertext);
+    const hash = await sha256Hex(plain);
+    const existing = manifest.chunks[hash];
+    if (existing) {
+      // Already have these bytes (same hash): the blob is a dup.
+      return { hash, stored: false };
+    }
+    const alreadyInRepo = await this.client.getBlob(blobPath(blobId));
+    if (alreadyInRepo === null) {
+      await this.client.putBlob(blobPath(blobId), storedBytes);
+    }
+    manifest.chunks[hash] = {
+      blobId,
+      size: plain.length,
+      encryptedSize: ciphertext.length + 12,
+      refCount: 0,
+    };
+    return { hash, stored: true };
   }
 
   /** Download a file: fetch + decrypt + hash-verify every chunk,

@@ -15,6 +15,7 @@ import type { GithubFetchFn, PublishResult } from "./publish.js";
 import { siteRepoName } from "./publish.js";
 import { CollabRelay } from "./collab/relay.js";
 import { CollabSession } from "./collab/session.js";
+import type { CollabP2PHook } from "./collab/session.js";
 import { applyBlockOps, diffBlocks, mergeSnapshot } from "./collab/merge.js";
 import type { PlacementKey } from "./collab/merge.js";
 import type {
@@ -50,6 +51,8 @@ export interface CollabStartOptions {
   now?: () => number;
   /** False = no timers (tests drive pollOnce by hand). */
   autoPoll?: boolean;
+  /** Optional P2P hook (phase 2): rides alongside the relay. */
+  p2p?: CollabP2PHook | null;
 }
 
 export interface PageRecord {
@@ -197,6 +200,9 @@ export class EditorState {
       onRemoteStates: (states) => this.applyRemoteStates(states),
       onPresence: (peers) => {
         this.collabPeers = peers;
+        // The P2P hook connects lazily to logins the relay poll
+        // reports (team membership is checked by the hook/host).
+        this.collabSession?.notePresence(peers.map((p) => p.login));
       },
       onError: (err) => {
         this.collabOffline = true;
@@ -206,6 +212,12 @@ export class EditorState {
       heartbeatMs: options.heartbeatMs,
       now: this.collabNow,
       autoPoll: options.autoPoll,
+      p2p: options.p2p ?? undefined,
+      // Remote ops that arrived over the data channel: same LWW
+      // apply path as relay states.
+      onP2POps: (ops) => {
+        this.applyRemoteBlockOps(ops);
+      },
     });
     await session.join();
     this.collabSession = session;
