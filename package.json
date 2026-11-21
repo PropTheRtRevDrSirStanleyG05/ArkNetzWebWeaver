@@ -1,0 +1,26 @@
+{
+  "dependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.27",
+    "@noble/hashes": "^2.4.0",
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "description": "ArkNetzWebWeaver by STANBEYOND — zero-server, $0/month decentralized web. Core shell 0.1.0 + visual builder 0.2.0: live-canvas Gutenberg-style editor sharing the reader's renderer, themes, revisions, roles, WXR import, static .zip export.",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.0"
+  },
+  "license": "MIT",
+  "name": "arknetzwebweaver",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "npm run build && npx --yes @tauri-apps/cli@2 dev",
+    "tauri": "tauri",
+    "tauri:build": "npm run build && npx --yes @tauri-apps/cli@2 build",
+    "test": "npm run build && node --test dist/tests/*.test.js"
+  },
+  "type": "module",
+  "version": "0.3.0"
+}

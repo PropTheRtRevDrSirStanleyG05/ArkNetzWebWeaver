@@ -1,0 +1,1 @@
+{"$schema":"https://schema.tauri.app/config/2/capabilities","description":"Core shell capabilities — shell plugin only, no filesystem/network access beyond the webview's own fetch. Plus deep-link: the OS hands arknetz:// URLs to the app (see src/lib/deep-link.ts).","identifier":"default","permissions":["core:default","core:event:default","deep-link:default"],"windows":["main"]}

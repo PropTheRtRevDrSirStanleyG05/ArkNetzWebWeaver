@@ -1,0 +1,117 @@
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;font-family:system-ui,sans-serif;color:#111827;background:#fff;overflow-x:hidden}
+html{overflow-x:hidden}
+/* P6: visible focus on every real control; the body itself (tabindex="-1"
+   in index.html) is never a tab stop and never shows a focus ring. */
+:focus-visible{outline:2px solid #2563eb;outline-offset:2px}
+body:focus{outline:none}
+.an-topbar{display:flex;justify-content:space-between;align-items:center;gap:.5rem;padding:.5rem 1rem;background:#111827;color:#fff;flex-wrap:wrap}
+.an-brand{font-weight:700;flex-shrink:0}
+.an-account{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;justify-content:flex-end;min-width:0;flex:1}
+#guest-badge{background:#374151;border-radius:999px;padding:.15rem .6rem;font-size:.85rem;white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+#signin-btn{white-space:normal;text-align:left}
+/* B8: sign-in status strip below the topbar — full message, wrapped,
+   never inside the header. Hidden until there is a message. */
+.an-signin-status{padding:.5rem 1rem;background:#fef3c7;color:#92400e;font-size:.9rem;overflow-wrap:break-word}
+button{cursor:pointer;border:1px solid #d1d5db;background:#fff;border-radius:6px;padding:.35rem .7rem}
+button:disabled{opacity:.45;cursor:default}
+.an-tabbar{display:flex;gap:.25rem;padding:.25rem .5rem;background:#f3f4f6;border-bottom:1px solid #e5e7eb;overflow-x:auto}
+.an-tab{padding:.3rem .7rem;border:1px solid #d1d5db;border-bottom:none;border-radius:6px 6px 0 0;background:#fff;white-space:nowrap}
+.an-tab[aria-selected="true"]{background:#2563eb;color:#fff;border-color:#2563eb}
+/* B7: the toolbar wraps instead of overflowing at 390px; the address
+   field shrinks (min-width:0) instead of pushing Go/Bookmark/Edit off
+   the right edge. */
+.an-toolbar{display:flex;gap:.4rem;padding:.5rem;align-items:center;flex-wrap:wrap}
+.an-toolbar button{flex-shrink:0}
+#address-input{flex:1 1 160px;min-width:0;padding:.4rem .6rem;border:1px solid #d1d5db;border-radius:6px}
+.an-layout{display:grid;grid-template-columns:260px 1fr;gap:1rem;padding:0 1rem 1rem}
+.an-sidebar{min-width:0}
+.an-sidebar input{max-width:100%}
+.an-sidebar h2{font-size:1rem;margin:.75rem 0 .25rem}
+.an-sidebar ul{list-style:none;padding:0;margin:0}
+.an-sidebar li{margin:.25rem 0}
+.an-note{font-size:.85rem;color:#6b7280}
+.an-reader{min-width:0}
+/* B7: code blocks scroll internally, never widen the page. */
+.an-reader pre{max-width:100%;overflow-x:auto;box-sizing:border-box}
+.an-reader code{overflow-wrap:break-word}
+.an-reader img,.an-reader video,.an-reader iframe{max-width:100%}
+.an-footer{padding:.75rem 1rem;border-top:1px solid #e5e7eb;color:#6b7280;font-size:.85rem}
+@media (max-width:700px){
+  .an-layout{grid-template-columns:1fr}
+  /* B1 (mobile): the editor is the single column, not a second one.
+     R2: this rule must BEAT the later base .an-editor{grid-column:2}
+     — same specificity + later order used to win, crushing the sidebar
+     to 0px at 390px. .an-layout .an-editor outranks it regardless of
+     order, so the editor stacks in column 1 on narrow screens. */
+  .an-layout .an-editor{grid-column:1;grid-row:auto}
+  .an-topbar{padding:.5rem}
+  .an-toolbar button{padding:.35rem .5rem}
+}
+
+/* --- Panels (B2): full-width strip under the toolbar, not the sidebar. --- */
+.an-panels{padding:.5rem 1rem .75rem;border-bottom:1px solid #e5e7eb;background:#f9fafb}
+.an-panel-nav{display:flex;flex-wrap:wrap;gap:.35rem}
+.an-panel-host{margin-top:.5rem;min-width:0}
+.an-panel-host h2{font-size:16px;margin:0 0 4px}
+.an-panel-host h3{font-size:14px;margin:12px 0 4px}
+.an-panel-host label{display:block;margin:6px 0;font-size:13px}
+.an-panel-host input,.an-panel-host select,.an-panel-host textarea{width:100%;box-sizing:border-box;margin-top:2px;padding:4px;max-width:100%}
+.an-panel-host button{margin:4px 4px 4px 0;padding:4px 10px;cursor:pointer}
+
+/* --- IA settings form (B10): labels above inputs, full width, so a
+   label never wraps mid-phrase with the input wedged between fragments. --- */
+.an-ia-form label{display:block;font-weight:600;font-size:.9rem;margin:.6rem 0 .2rem}
+.an-ia-form input{display:block;width:100%;padding:.4rem .6rem;border:1px solid #d1d5db;border-radius:6px}
+.an-settings-row{display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.5rem}
+
+/* --- Visual builder (0.2.0) --- */
+/* B1: the editor REPLACES the reader in place — same grid cell
+   (column 2, row 1), never a new row below the sidebar/reader at the
+   footer's position. The reader is hidden while the editor is open, so
+   the two never overlap; main.ts also scrolls the editor into view. */
+.an-editor{grid-column:2;grid-row:1;min-width:0;scroll-margin-top:.5rem}
+.an-editor-bar{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;padding:.5rem;border:1px solid #d1d5db;border-radius:8px;background:#f9fafb;margin-bottom:.75rem}
+.an-editor-bar select,.an-editor-bar input{padding:.35rem;border:1px solid #d1d5db;border-radius:6px}
+.an-editor-bar #editor-status{flex:1;min-width:200px;font-size:.85rem;color:#374151}
+.an-file-label{font-size:.85rem}
+.an-editor-layout{display:grid;grid-template-columns:1fr 280px;gap:1rem}
+.an-editor-main{min-width:0}
+.an-ed-block{border:1px solid #e5e7eb;border-radius:8px;padding:.5rem;margin-bottom:.5rem;background:#fff}
+.an-ed-block[data-selected="true"]{border-color:#2563eb;box-shadow:0 0 0 1px #2563eb}
+.an-ed-bar{display:flex;gap:.35rem;align-items:center;margin-bottom:.35rem;font-size:.8rem;color:#6b7280}
+.an-ed-bar .an-ed-label{font-weight:600;color:#111827}
+.an-ed-bar button{padding:.15rem .45rem;font-size:.8rem}
+.an-ed-text{outline:none;padding:.25rem;border-radius:4px}
+.an-ed-text:focus{background:#eff6ff}
+.an-ed-text:empty::before{content:"Empty — click to type";color:#9ca3af}
+.an-ed-field{width:100%;padding:.35rem;border:1px solid #d1d5db;border-radius:6px;margin:.2rem 0}
+.an-slash-row{display:flex;gap:.4rem;margin:.75rem 0}
+.an-slash-row input{flex:1;padding:.45rem .6rem;border:1px solid #d1d5db;border-radius:6px}
+.an-preview{border:1px dashed #d1d5db;border-radius:8px;padding:.5rem}
+.an-editor-sidebar h3{font-size:.95rem;margin:.5rem 0}
+.an-editor-sidebar label{display:block;font-size:.85rem;margin:.4rem 0}
+/* B9: editor sidebar nav URLs must not clip mid-word — long URLs wrap
+   at any character instead of running off the 280px column with the
+   final letter cut off. The full URL is also the li's title tooltip
+   (set by main.ts), so nothing is hidden.
+   Nit (b): break-anywhere wrapping broke NORMAL words mid-word
+   ("abo ut") — it inserts a break opportunity between every
+   character. break-word only breaks a word that cannot fit on a line
+   by itself (i.e. a long URL), so labels wrap at spaces and long URLs
+   still break at the edge instead of clipping. */
+.an-editor-sidebar{min-width:0;overflow-wrap:break-word}
+.an-editor-sidebar ul{overflow-wrap:break-word}
+.an-editor-sidebar li{overflow-wrap:break-word}
+.an-editor-sidebar input[type="text"],.an-editor-sidebar select{width:100%;padding:.35rem;border:1px solid #d1d5db;border-radius:6px}
+.an-diff-added{color:#047857;background:#ecfdf5}
+.an-diff-removed{color:#b91c1c;background:#fef2f2;text-decoration:line-through}
+.an-diff-changed{color:#92400e;background:#fffbeb}
+.an-diff-same{color:#6b7280}
+@media (max-width:900px){.an-editor-layout{grid-template-columns:1fr}}
+
+/* Phase panels — button style only; nav/host layout lives in the
+   .an-panels block above (B2). */
+.an-panel-btn{padding:4px 8px;border:1px solid #d1d5db;background:#fff;border-radius:6px;cursor:pointer;font-size:13px}
+.an-panel-btn[aria-selected="true"]{background:#111827;color:#fff;border-color:#111827}
