@@ -1,8 +1,12 @@
 // Tests: Zstd dictionary v2 — genuinely trained (fix round 3, item 3).
 // v2 was trained with `zstd --train` on a 3,200-file corpus built from
 // this project's own .json.zst schemas (dict-training/README.md).
-// v1 still decodes (round-trip tests for both versions); new files are
-// written with v2.
+// DEPRECATED 2026-11-21 (Stanley's decision; benchmark proved v2 saves
+// zero bytes on realistic payloads): v2 is now a LEGACY decode
+// dictionary only. New files are plain zstd (no dictionary ID); v1
+// and v2 frames already published still decode through
+// decompressBytes, and these tests pin both the v2 bytes and that
+// decode path.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -57,16 +61,21 @@ test("dictionary v2 identity: version, label, ID, magic, exact size, SHA-256", a
   // Deterministic: rebuilding the cached copy gives identical bytes.
   resetZstdDictionaryV2ForTests();
   assert.deepEqual(getZstdDictionaryV2(), dict);
-  // v2 is the current dictionary.
+  // v2 is the legacy decode dictionary (getCurrentZstdDictionary
+  // still returns the v2 bytes for decoding old frames).
   assert.deepEqual(getCurrentZstdDictionary(), dict);
 });
 
-test("every frame the client writes now carries the v2 dictionary ID", async () => {
+test("new frames carry NO dictionary ID; explicit v2 frames still carry it", async () => {
   const compressed = await compressJson({ domain: "computers.edu", title: "Computers", blocks: [] });
-  assert.equal(frameDictionaryId(compressed), ZSTD_DICTIONARY_V2_ID);
+  assert.equal(frameDictionaryId(compressed), null, "new frames must be plain zstd");
+  const input = new TextEncoder().encode(JSON.stringify({ domain: "computers.edu", title: "Computers" }));
+  const v2Frame = await compressBytesWithDictionary(input, getZstdDictionaryV2());
+  assert.equal(frameDictionaryId(v2Frame), ZSTD_DICTIONARY_V2_ID);
+  assert.deepEqual(await decompressBytes(v2Frame), input, "old v2 frame still decodes");
 });
 
-test("v2 round-trips every document kind, byte-identical", async () => {
+test("plain round-trips every document kind, byte-identical", async () => {
   const docs = {
     site: { domain: "computers.edu", title: "Computers", blocks: [{ type: "h1", text: "Hello" }, { type: "p", text: "A paragraph with some repeated words words words." }] },
     registry: { "computers.edu": { domain: "computers.edu", backend: "gh:alice/arknetz-site-computers-edu", shard: "a", owner: "alice", updated: 1794000000 } },
@@ -77,11 +86,16 @@ test("v2 round-trips every document kind, byte-identical", async () => {
   for (const [name, value] of Object.entries(docs)) {
     const json = JSON.stringify(value);
     const compressed = await compressJson(value);
-    assert.equal(frameDictionaryId(compressed), ZSTD_DICTIONARY_V2_ID, `${name}: frame lacks the v2 ID`);
+    assert.equal(frameDictionaryId(compressed), null, `${name}: new frame must carry no dictionary ID`);
     const back = await decompressJson(compressed);
     assert.deepEqual(back, value, `${name}: round-trip changed the value`);
     assert.equal(JSON.stringify(back), json, `${name}: round-trip JSON is not byte-identical`);
   }
+  // ...and an explicit v2 frame still round-trips through the same path.
+  const v2Input = new TextEncoder().encode(JSON.stringify(docs.site));
+  const v2Frame = await compressBytesWithDictionary(v2Input, getZstdDictionaryV2());
+  assert.equal(frameDictionaryId(v2Frame), ZSTD_DICTIONARY_V2_ID);
+  assert.deepEqual(await decompressBytes(v2Frame), v2Input);
 });
 
 test("v1 frames still decode through the built-in path (backward compatibility)", async () => {
@@ -98,7 +112,7 @@ test("v1 frames still decode through the built-in path (backward compatibility)"
 
 test("v2 frames are refused by the v1 dictionary alone, and an unknown dictionary fails loudly", async () => {
   const input = new TextEncoder().encode(JSON.stringify({ domain: "computers.edu", title: "Computers" }));
-  const v2Frame = await compressBytes(input);
+  const v2Frame = await compressBytesWithDictionary(input, getZstdDictionaryV2());
   assert.equal(frameDictionaryId(v2Frame), ZSTD_DICTIONARY_V2_ID);
   await assert.rejects(() => decompressBytesWithDictionary(v2Frame, getZstdDictionary()), /decompress/i);
   // A frame compressed with a dictionary nobody knows (different ID,
@@ -110,7 +124,12 @@ test("v2 frames are refused by the v1 dictionary alone, and an unknown dictionar
   await assert.rejects(() => decompressBytes(unknownFrame), /v2-trained.*v1-corpus-derived|unknown dictionary/);
 });
 
-test("v2 beats plain Zstd on representative documents, and beats v1 where it was trained to", async () => {
+test("legacy v2 dictionary: beats plain on representative documents, and beats v1 where it was trained to", async () => {
+  // Measured behaviour of the LEGACY v2 dictionary (explicit
+  // compressBytesWithDictionary — new production frames are plain).
+  // The dictionary did help on small docs; at realistic scale its
+  // advantage is <= 300 bytes either way (see tests/zstd.test.ts),
+  // which is why it was dropped 2026-11-21.
   const { getZstdEngine } = await import("../src/lib/zstd.js");
   const engine = await getZstdEngine();
   const docs = {
@@ -120,7 +139,7 @@ test("v2 beats plain Zstd on representative documents, and beats v1 where it was
   };
   for (const [name, value] of Object.entries(docs)) {
     const input = new TextEncoder().encode(JSON.stringify(value));
-    const v2 = await compressBytes(input);
+    const v2 = await compressBytesWithDictionary(input, getZstdDictionaryV2());
     const plain = engine.compress(input, 3);
     assert.ok(v2.length < plain.length, `${name}: v2 did not beat plain (${v2.length} vs ${plain.length} for ${input.length} input bytes)`);
     assert.deepEqual(await decompressBytes(v2), input, `${name}: v2 round-trip`);
@@ -144,7 +163,7 @@ test("v2 beats plain Zstd on representative documents, and beats v1 where it was
   };
   const registryInput = new TextEncoder().encode(JSON.stringify(novelRegistry));
   assert.ok(
-    (await compressBytes(registryInput)).length <
+    (await compressBytesWithDictionary(registryInput, getZstdDictionaryV2())).length <
       (await compressBytesWithDictionary(registryInput, getZstdDictionary())).length,
     "novel registry: trained v2 must beat corpus-derived v1",
   );
@@ -159,7 +178,7 @@ test("v2 beats plain Zstd on representative documents, and beats v1 where it was
   };
   const mailInput = new TextEncoder().encode(JSON.stringify(novelMail));
   assert.ok(
-    (await compressBytes(mailInput)).length <
+    (await compressBytesWithDictionary(mailInput, getZstdDictionaryV2())).length <
       (await compressBytesWithDictionary(mailInput, getZstdDictionary())).length,
     "novel mail: trained v2 must beat corpus-derived v1",
   );
@@ -187,7 +206,7 @@ test("v2 beats plain Zstd on representative documents, and beats v1 where it was
     updated: 1794020000,
   };
   const bigInput = new TextEncoder().encode(JSON.stringify(bigSite));
-  const bigV2 = await compressBytes(bigInput);
+  const bigV2 = await compressBytesWithDictionary(bigInput, getZstdDictionaryV2());
   const bigPlain = engine.compress(bigInput, 3);
   assert.ok(bigV2.length < bigPlain.length, `big site: v2 did not beat plain (${bigV2.length} vs ${bigPlain.length} for ${bigInput.length} input bytes)`);
   assert.deepEqual(await decompressBytes(bigV2), bigInput, "big site: v2 round-trip");

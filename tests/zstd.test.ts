@@ -1,17 +1,20 @@
-// Tests: real Zstd round-trip for .json.zst files (@bokuweb/zstd-wasm, MIT),
-// with the v2 dictionary wired in (see src/lib/zstd.ts; v2 is genuinely
-// trained with `zstd --train` — dict-training/README.md). v1
-// ("v1-corpus-derived") is kept only so old files still decode:
-// decompressBytes tries v2, then v1, then plain frames.
+// Tests: real Zstd round-trip for .json.zst files (@bokuweb/zstd-wasm, MIT).
+// Since 2026-11-21 new files are PLAIN zstd — the v2 dictionary was
+// dropped (Stanley's decision; benchmark BENCHMARK-0.4.0.md proved it
+// saves zero bytes on realistic payloads). v1 ("v1-corpus-derived")
+// and v2 ("v2-trained") are kept ONLY so old published frames still
+// decode: decompressBytes tries v2, then v1, then plain frames.
+// (dict-training/README.md records how v2 was trained.)
 //
-// The dictionary is a FORMATTED dictionary (RFC 8878 section 5): its ID
-// is embedded in every frame it compresses, so decompressing with a
-// wrong dictionary, a raw dictionary, or no dictionary at all throws
-// loudly instead of silently returning garbage. A raw-content dictionary
-// does NOT do this — verified 2026-11-20, a frame decompressed with an
-// all-0x07 dictionary returned wrong bytes with no error — which is why
-// v1 is formatted, and why these tests pin the ID mechanism, not just
-// the round-trip.
+// A dictionary frame is still a FORMATTED dictionary frame (RFC 8878
+// section 5): its ID is embedded in every frame it compresses, so
+// decompressing with a wrong dictionary, a raw dictionary, or no
+// dictionary at all throws loudly instead of silently returning
+// garbage. A raw-content dictionary does NOT do this — verified
+// 2026-11-20, a frame decompressed with an all-0x07 dictionary
+// returned wrong bytes with no error — which is why v1/v2 are
+// formatted, and why these tests pin the ID mechanism, not just the
+// round-trip.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -25,6 +28,7 @@ import {
   decompressJson,
   getZstdDictionary,
   getZstdDictionaryContent,
+  getZstdDictionaryV2,
   getZstdEngine,
   isZstdFrame,
   resetZstdDictionaryForTests,
@@ -193,12 +197,18 @@ test("dictionary v1 identity: version, label, ID, magic, exact size, SHA-256", a
   assert.deepEqual(getZstdDictionary(), dict);
 });
 
-test("every frame compressed with v2 carries the v2 dictionary ID", async () => {
+test("new frames carry NO dictionary ID (plain zstd since 2026-11-21)", async () => {
   const compressed = await compressJson(SAMPLE_DOC);
-  assert.equal(frameDictionaryId(compressed), ZSTD_DICTIONARY_V2_ID);
+  assert.equal(frameDictionaryId(compressed), null, "new frames must be plain zstd, no dictionary ID");
   const plain = await compressBytes(new TextEncoder().encode('{"a":1}'));
-  assert.equal(frameDictionaryId(plain), ZSTD_DICTIONARY_V2_ID);
-  // ...and the old v1 dictionary still stamps its own ID when used explicitly.
+  assert.equal(frameDictionaryId(plain), null);
+  // ...and the old dictionaries still stamp their own IDs when used
+  // explicitly (the legacy path old files were written with).
+  const v2 = await compressBytesWithDictionary(
+    new TextEncoder().encode(JSON.stringify(SAMPLE_DOC)),
+    getZstdDictionaryV2(),
+  );
+  assert.equal(frameDictionaryId(v2), ZSTD_DICTIONARY_V2_ID);
   const v1 = await compressBytesWithDictionary(
     new TextEncoder().encode(JSON.stringify(SAMPLE_DOC)),
     getZstdDictionary(),
@@ -220,7 +230,7 @@ test("round-trip is byte-identical for registry, site, mail and manifest JSON", 
     const json = JSON.stringify(value);
     const compressed = await compressJson(value);
     assert.ok(isZstdFrame(compressed), `${name}: not a Zstd frame`);
-    assert.equal(frameDictionaryId(compressed), ZSTD_DICTIONARY_V2_ID, `${name}: frame lacks the v2 ID`);
+    assert.equal(frameDictionaryId(compressed), null, `${name}: new frame must carry no dictionary ID`);
     const back = await decompressJson(compressed);
     assert.deepEqual(back, value, `${name}: round-trip changed the value`);
     assert.equal(JSON.stringify(back), json, `${name}: round-trip JSON is not byte-identical`);
@@ -243,23 +253,46 @@ test("round-trip is exact for empty and small inputs", async () => {
   }
 });
 
-test("the dictionary beats plain Zstd on representative documents", async () => {
+test("plain zstd keeps the win at realistic scale; the dictionary's advantage is negligible", async () => {
+  // Measured 2026-11-21 (this file's fixtures, same shapes as the
+  // benchmark): on a 1,000-entry registry (126,451 raw bytes) plain
+  // compresses to 4,224 bytes and v2 to 3,970 — a 254-byte difference,
+  // 0.2% of the raw size. On a 92 KB site plain is 182 bytes, v2 141
+  // — 41 bytes. On a 100-entry registry v2 is WORSE by 577 bytes
+  // (1,306 vs 729). The dictionary never buys anything material at
+  // realistic scale — that is why it was dropped. This test pins the
+  // bound (<= 300 bytes either way at realistic scale) and that plain
+  // zstd itself keeps the real compression win (>10x on both shapes).
   const engine = await getZstdEngine();
-  for (const [name, value] of Object.entries({
-    site: SAMPLE_DOC,
-    registry: REGISTRY_SHARD,
-    mail: MAIL_ENVELOPE,
-  })) {
+  const registry1000 = Object.fromEntries(
+    Array.from({ length: 1000 }, (_, i) => [
+      `d${i}.example`,
+      { domain: `d${i}.example`, backend: `gh:u${i}/arknetz-site-d${i}`, shard: "a", owner: `u${i}`, updated: 1794000000 },
+    ]),
+  );
+  const site50k = {
+    domain: "big.example",
+    title: "Big",
+    blocks: Array.from({ length: 200 }, () => ({
+      type: "p",
+      text: "The harbour master keeps a ledger of every boat that leaves the pier, written in pencil, because the ink runs when the spray comes over the wall. ".repeat(3),
+    })),
+  };
+  for (const [name, value] of Object.entries({ registry1000, site50k })) {
     const input = new TextEncoder().encode(JSON.stringify(value));
-    const withDict = await compressBytes(input);
-    const plain = engine.compress(input, 3);
+    const plain = await compressBytes(input);
+    const v2 = await compressBytesWithDictionary(input, getZstdDictionaryV2());
     assert.ok(
-      withDict.length < plain.length,
-      `${name}: dictionary did not help (${withDict.length} vs plain ${plain.length} for ${input.length} input bytes)`,
+      Math.abs(plain.length - v2.length) <= 300,
+      `${name}: dictionary advantage is not negligible (${plain.length} plain vs ${v2.length} v2 for ${input.length} input bytes)`,
     );
-    assert.deepEqual(await decompressBytes(withDict), input, `${name}: dict round-trip`);
-    assert.deepEqual(engine.decompress(plain), input, `${name}: plain round-trip sanity`);
+    assert.ok(plain.length < input.length / 10, `${name}: plain zstd lost the compression win (${plain.length} of ${input.length})`);
+    assert.deepEqual(await decompressBytes(plain), input, `${name}: plain round-trip`);
+    assert.deepEqual(await decompressBytes(v2), input, `${name}: v2 round-trip sanity`);
   }
+  // New production frames are byte-identical to plain engine.compress.
+  const input = new TextEncoder().encode(JSON.stringify(SAMPLE_DOC));
+  assert.deepEqual(await compressBytes(input), engine.compress(input, 3));
 });
 
 // ---------------------------------------------------------------------------
@@ -267,7 +300,10 @@ test("the dictionary beats plain Zstd on representative documents", async () => 
 // ---------------------------------------------------------------------------
 
 test("decompressing with a wrong dictionary ID throws loudly", async () => {
-  const compressed = await compressJson(SAMPLE_DOC);
+  // Fixture must be a dictionary frame: build one explicitly with v2
+  // (new production frames are plain and carry no ID to mismatch).
+  const input = new TextEncoder().encode(JSON.stringify(SAMPLE_DOC));
+  const compressed = await compressBytesWithDictionary(input, getZstdDictionaryV2());
   // Same content, a different ID that no real dictionary uses
   // (0x41524B09 — NOT the v1 or v2 ID, so the ID itself mismatches).
   const wrongId = buildFormattedZstdDictionary(0x41524b09, getZstdDictionaryContent());
@@ -282,7 +318,8 @@ test("decompressing with a wrong dictionary ID throws loudly", async () => {
 });
 
 test("decompressing with a raw-content dictionary throws loudly", async () => {
-  const compressed = await compressJson(SAMPLE_DOC);
+  const input = new TextEncoder().encode(JSON.stringify(SAMPLE_DOC));
+  const compressed = await compressBytesWithDictionary(input, getZstdDictionaryV2());
   // A raw-content dictionary has no ID, so the frame's ID cannot match.
   await assert.rejects(
     () => decompressBytesWithDictionary(compressed, getZstdDictionaryContent()),
@@ -292,7 +329,8 @@ test("decompressing with a raw-content dictionary throws loudly", async () => {
 
 test("decompressing a dictionary frame with no dictionary at all throws", async () => {
   const engine = await getZstdEngine();
-  const compressed = await compressJson(SAMPLE_DOC);
+  const input = new TextEncoder().encode(JSON.stringify(SAMPLE_DOC));
+  const compressed = await compressBytesWithDictionary(input, getZstdDictionaryV2());
   await assert.rejects(async () => engine.decompress(compressed), /./, "plain decompress of a dict frame must throw");
   // And the built-in path's error names the dictionaries it knows.
   const truncated = compressed.slice(0, compressed.length - 2);
@@ -300,7 +338,8 @@ test("decompressing a dictionary frame with no dictionary at all throws", async 
 });
 
 test("a truncated dictionary frame throws instead of returning partial data", async () => {
-  const compressed = await compressJson(SAMPLE_DOC);
+  const input = new TextEncoder().encode(JSON.stringify(SAMPLE_DOC));
+  const compressed = await compressBytesWithDictionary(input, getZstdDictionaryV2());
   const cut = compressed.slice(0, Math.floor(compressed.length / 2));
   await assert.rejects(() => decompressBytes(cut), /zstd|decompress/i);
 });

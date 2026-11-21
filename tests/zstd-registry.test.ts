@@ -7,10 +7,12 @@ import { CachedFetcher, createMemoryCacheStore } from "../src/lib/cache.js";
 import { RegistryResolver, shardForDomain } from "../src/lib/registry.js";
 import {
   buildFormattedZstdDictionary,
+  compressBytesWithDictionary,
   compressJson,
+  decompressBytes,
   decompressBytesWithDictionary,
   getZstdDictionaryContent,
-  ZSTD_DICTIONARY_V2_ID,
+  getZstdDictionaryV2,
 } from "../src/lib/zstd.js";
 
 const DOMAIN = "computers.edu";
@@ -108,30 +110,28 @@ test("a corrupt .zst shard throws — it does not silently fall back", async () 
   await assert.rejects(() => resolver.resolve(DOMAIN), /zstd|decompress/i);
 });
 
-test("registry/site .zst bytes are dictionary frames (v2 ID) and refuse a wrong dictionary", async () => {
+test("registry/site .zst bytes are plain zstd frames (no dictionary ID) since 2026-11-21", async () => {
   const { fetcher, servedZst } = mockFetcher({ zstShard: true, zstSite: true });
   const resolver = new RegistryResolver(fetcher);
   await resolver.resolve(DOMAIN);
   await resolver.loadSite(DOMAIN);
   // Served frames: the shard (resolve runs once per call, and loadSite
-  // resolves again) plus the site — at least two, each carrying the v2
-  // dictionary ID in its header: DID flag 3 (4-byte ID) at byte 4,
-  // ID little-endian at bytes 5-8.
+  // resolves again) plus the site — at least two, each a PLAIN zstd
+  // frame: DID flag 0 (no dictionary ID) at byte 4. The dictionary
+  // was dropped 2026-11-21 (benchmark: zero bytes saved).
   assert.ok(servedZst.length >= 2, `expected shard + site frames, got ${servedZst.length}`);
   for (const frame of servedZst) {
-    assert.equal((frame[4] as number) & 3, 3, "frame must carry a 4-byte dictionary ID");
-    const id =
-      (frame[5] as number) |
-      ((frame[6] as number) << 8) |
-      ((frame[7] as number) << 16) |
-      ((frame[8] as number) << 24);
-    assert.equal(id >>> 0, ZSTD_DICTIONARY_V2_ID, "frame must carry the v2 dictionary ID");
-    // And a wrong dictionary must refuse these exact served bytes.
-    // (0x41524B09: an ID no shipped dictionary uses — NOT v1+1, which
-    // is the real v2 ID 0x41524B02 and would match the frame's ID.)
-    const wrong = buildFormattedZstdDictionary(0x41524b09, getZstdDictionaryContent());
-    await assert.rejects(() => decompressBytesWithDictionary(frame, wrong), /decompress/i);
+    assert.equal((frame[4] as number) & 3, 0, "frame must carry no dictionary ID (plain zstd)");
   }
+  // ...and an OLD v2 dictionary frame still decodes through the same
+  // built-in path, while a wrong dictionary refuses it loudly.
+  // (0x41524B09: an ID no shipped dictionary uses — NOT v1+1, which
+  // is the real v2 ID 0x41524B02 and would match the frame's ID.)
+  const input = new TextEncoder().encode(JSON.stringify(await shardDoc()));
+  const v2Frame = await compressBytesWithDictionary(input, getZstdDictionaryV2());
+  assert.deepEqual(await decompressBytes(v2Frame), input);
+  const wrong = buildFormattedZstdDictionary(0x41524b09, getZstdDictionaryContent());
+  await assert.rejects(() => decompressBytesWithDictionary(v2Frame, wrong), /decompress/i);
 });
 
 test("fetchBytes caches: a 304 returns the cached bytes with fromCache", async () => {

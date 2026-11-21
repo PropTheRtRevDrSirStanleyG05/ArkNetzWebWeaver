@@ -2362,3 +2362,67 @@ build` was run per the benchmark constraint); `cargo check` for the
 opener plugin — PASSED (exit 0, 2m 09s, after the system-deps reinstall);
 live REGISTER round-trip
 (no GitHub Action has run anywhere yet); live mail/IA/collab round-trips.
+
+## Zstd v2 dictionary drop (2026-11-21, Stanley's decision 14:17 PST)
+
+- **Decision:** drop the v2 dictionary. The benchmark (BENCHMARK-0.4.0.md)
+  found it saves ZERO bytes on every realistic payload tested; plain zstd
+  keeps every measured win. Stanley: "I guess drop the dictionary".
+- **Re-measured evidence (in-app engine, this VM) — the honest correction
+  to the benchmark's "0 bytes" shorthand:** on TINY docs the dictionary
+  does save bytes (158 B site: plain 122, v2 82, v1 69; 191 B registry:
+  plain 128, v2 61, v1 37; 125 B mail: plain 112, v2 50, v1 53). At
+  realistic scale the advantage is negligible and sometimes negative:
+  100-entry registry (14,251 raw): plain 729, v2 1,306 — v2 WORSE by 577;
+  1,000-entry registry (126,451 raw): plain 4,224, v2 3,970 — 254 bytes
+  (0.2% of raw); 92 KB site: plain 182, v2 141 — 41 bytes. Tests assert
+  the measured bound (≤300 bytes either way at realistic scale) plus
+  plain zstd keeping the real win (>10×), NOT "zero bytes" on small docs.
+- **Client (`src/lib/zstd.ts`):** `compressBytes` now plain
+  `engine.compress` — new frames carry NO DictID. `decompressBytes`
+  unchanged: tries v2, then v1, then plain, so every already-published
+  dictionary frame (DictID `0x41524B02`) still decodes — nothing on
+  GitHub breaks. `compressBytesWithDictionary` /
+  `decompressBytesWithDictionary` kept as legacy/explicit (old-frame
+  fixtures need them). `ZSTD_DICTIONARY_CURRENT_*` /
+  `getCurrentZstdDictionary()` kept but re-documented as the legacy
+  decode dictionary. The client never fetched a dictionary at runtime
+  (dictionaries were embedded), so there was no startup/sync fetch to
+  remove. `ZSTD_DICTIONARY_CONTENT_SOURCE` deliberately UNTOUCHED — it
+  is shipped training data for the v1 decode dictionary; changing it
+  would desync corpus from shipped dictionary.
+- **Workflows:** client `protocol/register.yml` rewritten to 253 lines —
+  plain `zstd -d` / `zstd`, no dictionary fetch, no `-D`; comments
+  explain old dict frames fall back to the plain mirror and get
+  rewritten as plain zstd. Copied to all 17 seed copies (16 registry
+  shards + arknetz-actions), verified byte-identical, zero
+  `zstd-dictionary` / `-D` references. **Live GitHub shards +
+  arknetz-actions still hold the 255-line dict version** — workflow
+  files cannot go via the connector (403); the web-UI pass is the
+  parent's step, using `protocol/register.yml` in the client repo as
+  the exact fixed text (253 lines).
+- **Docs:** PROTOCOL.md §4 carries the deprecation note (evidence +
+  re-measured numbers; new files plain zstd; manifest `zstdDictionary`
+  field deprecated and ignored; `.bin` files stay published, never
+  deleted; decoder keeps v2→v1→plain). Seed
+  `github-seed/arknetz-protocol/PROTOCOL.md` synced byte-identical.
+  Seed `github-seed/arknetz-protocol/README.md` updated (deprecation
+  banner, v1/v2 marked decode-only, `.bin` files kept).
+  `dict-training/` left alone (historical training record). P2P-SPEC.md
+  has no dictionary references — nothing to change there.
+- **Tests:** new `tests/zstd-dictionary-drop.test.ts` + updated
+  `tests/zstd.test.ts`, `tests/zstd-dict-v2.test.ts`,
+  `tests/zstd-registry.test.ts`. Scope battery **30 pass, 0 fail**
+  (re-verified after the full run). Full battery at drop time: **758
+  tests, 749 pass, 9 fail** — all 9 failures are media/p2p call tests
+  from the parallel media agent's in-progress work (recording consent,
+  quality monitor relayed event, getUserMedia failure, mixer
+  re-election, declined-call ×2, CallManager busy ×2, 1:1 voice/video
+  flow); zero failures in dictionary scope. `npm test` could not run
+  end-to-end at the time because `npm run build` chains on `tsc` and
+  the parallel agents' in-progress files had type errors (tsc still
+  emits JS; manual `npx tsc` → `copy-assets` → `node --test` was the
+  working battery route).
+- **Push:** client repo re-push + protocol-repo README/PROTOCOL.md
+  re-push via the connector (see sync records); live head commits
+  recorded in the final report. No release created; keystore untouched.
