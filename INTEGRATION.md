@@ -2905,6 +2905,44 @@ controller, all with tests)**
   AppImage, .deb, Windows .exe (cargo-xwin cross build), signed
   Android .apk (keystore alias arknetz-release, apksigner v2+v3
   verified). Hashes recorded in release-0.5.0/ and below.
+- Build environment (VM reset since 0.4.0): Tauri -dev packages were
+  wiped and the Hatch-patched libzstd1 had returned — reinstalled
+  libwebkit2gtk-4.1-dev, libgtk-3-dev, libayatana-appindicator3-dev,
+  librsvg2-dev (+ libssl-dev, build-essential, pkg-config, libxdo-dev)
+  and re-downgraded libzstd1 to stock 1.5.5+dfsg2-2build1.1 (the first
+  install failed with held broken packages — the patched libzstd1 was
+  blocking libzstd-dev; the downgrade first, then the install, worked).
+  `cargo tauri` is not installed as a subcommand here — Linux build
+  used `npm run tauri:build` (tauri-cli 2.12.6). Android build failed
+  twice at :app:mergeUniversalReleaseNativeLibs with
+  SSLHandshakeException: the egress CA had rotated and the JDK trust
+  store still held the old one (00:04:4A:EA…); the current CA
+  (F9:32:CD:41…, cert #120 in /run/hatch/egress-tls/ca-bundle.pem)
+  was extracted and re-imported into ~/jdk17 cacerts under the
+  hatch-egress-ca alias — the build then passed. (Note:
+  `keytool -importcert -file ca-bundle.pem` imports only the FIRST
+  cert in the bundle — the Hatch CA is the last of 121.) The opener
+  plugin (new in 0.4.1) pulls androidx.browser:browser:1.8.0 — the
+  first build that needed it; it resolves from Google's Maven repo.
+- Artifacts (2026-11-22, all from bump head cbfe22f5):
+  - ArkNetzWebWeaver_0.5.0_amd64.AppImage — 84,146,680 bytes,
+    SHA-256 83b9f7fba4f46bfdd428eab5120ad59dcf689a9526d26db2acf9fc5cbd764912
+    (extraction-verified only — no /dev/fuse in this VM; extracted
+    binary panics without a display, as expected headless).
+  - ArkNetzWebWeaver_0.5.0_amd64.deb — 5,596,314 bytes,
+    SHA-256 c3526d89c28f9092c5ece17b742c6cf328c1e3f89445e9d7d3b79fbcc34203c8
+  - ArkNetzWebWeaver-0.5.0.exe — 11,027,456 bytes,
+    SHA-256 93f872f1fb9939f25eddf490b902368ef7717f5015a30a2c23e9fc56511f06ee
+    (PE32+ x86-64, 9 sections; Wine smoke test: loads, reaches Tauri
+    setup, panics at app.rs:1444 "failed to create window" — no X
+    server, same as 0.4.0, not a bad binary; one benign LNK4099
+    debug-info warning at link time).
+  - ArkNetzWebWeaver-0.5.0.apk — 13,998,434 bytes,
+    SHA-256 2c03a13b40dcb2b468818d80bd3a63f480a1fbd2ebf982690977ac1678a7a71c
+    (aapt2: package com.stanbeyond.arknetzwebweaver, versionCode 5000,
+    versionName 0.5.0, minSdk 24, targetSdk 36; apksigner verifies,
+    v2 true, v3 true, v1 false — known quirk; signer cert SHA-256
+    5cc87c8a…c0c7 matches the 0.4.0 key, so updates will install).
 - Caveats carried into the GitHub Release: Windows .exe Wine-tested
   only (headless Wine panics at window creation, same as 0.4.0 — not
   a bad binary); APK never installed on a real device; no live
