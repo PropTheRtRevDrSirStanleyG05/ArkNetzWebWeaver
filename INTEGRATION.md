@@ -2884,3 +2884,7 @@ controller, all with tests)**
   TURN, Android screen-share button correctly disabled — the
   loopback/fake-peer double proves the control flow, not the
   media path.
+- **Pushed 2026-11-21, live head `c46a3c9f`** (27 files: media
+  core + UI wiring + tests + shot harnesses; verified live by
+  read-back — remote `src/lib/p2p/call-panel.ts` SHA-256
+  matches local byte-for-byte).
