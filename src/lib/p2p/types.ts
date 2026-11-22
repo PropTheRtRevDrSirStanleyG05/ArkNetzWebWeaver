@@ -50,6 +50,39 @@ export function defaultTurnConfig(): P2PTurnConfig {
   };
 }
 
+/** Media settings (real-time calls — MEDIA-SPEC.md). Defaults:
+ *  everything off. Media rides the P2P master switch: a call
+ *  refuses to run unless P2P is enabled AND its own flag is on
+ *  (same pattern as the phase-1 adapters). Lives here (not in
+ *  media.ts) so the settings store and the host can carry it
+ *  without a module cycle — media.ts re-exports these. */
+export interface MediaSettings {
+  /** Media on at all (master media switch). False by default. */
+  enabled: boolean;
+  /** 1:1 voice calls. */
+  voice: boolean;
+  /** 1:1 video calls. */
+  video: boolean;
+  /** Group calls. */
+  groups: boolean;
+  /** Screensharing (desktop only — Android is a stub, MEDIA-SPEC.md §5.2). */
+  screenShare: boolean;
+  /** Volunteer as a group-call mixer. False by default — nobody
+   *  is a mixer unless they explicitly opt in (MEDIA-SPEC.md §6.2). */
+  volunteerMixer: boolean;
+}
+
+export function defaultMediaSettings(): MediaSettings {
+  return {
+    enabled: false,
+    voice: false,
+    video: false,
+    groups: false,
+    screenShare: false,
+    volunteerMixer: false,
+  };
+}
+
 /** P2P settings. Defaults: everything off. Enabling the master
  *  switch does NOT enable any feature — each surface is opted into
  *  separately, and each adapter refuses to run unless both the master
@@ -72,6 +105,8 @@ export interface P2PSettings {
   /** Upload cap, KiB/s per peer. 0 = unlimited. */
   maxUploadKBps: number;
   turn: P2PTurnConfig;
+  /** Real-time media (calls). All off by default. */
+  media: MediaSettings;
 }
 
 export function defaultP2PSettings(): P2PSettings {
@@ -85,6 +120,7 @@ export function defaultP2PSettings(): P2PSettings {
     maxPeers: 8,
     maxUploadKBps: 512,
     turn: defaultTurnConfig(),
+    media: defaultMediaSettings(),
   };
 }
 

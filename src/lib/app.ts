@@ -44,6 +44,10 @@ import { defaultP2PSettings } from "./p2p/types.js";
 import type { P2PPeerInfo } from "./p2p/host.js";
 import type { P2PPeerRow } from "./p2p/panel.js";
 import type { CollabP2PHook } from "./collab/session.js";
+import { MediaCallController } from "./p2p/call-panel.js";
+import type { CallsHost } from "./p2p/call-panel.js";
+import { browserMediaDevices } from "./p2p/media-devices.js";
+import { WebRtcMediaConnectionFactory } from "./p2p/media-connection.js";
 import type { SearchIndexStore } from "./viewer/search.js";
 import type { ViewPingStore } from "./viewer/stats.js";
 import type { MyListStore, ProgressStore } from "./viewer/streaming.js";
@@ -79,6 +83,7 @@ export const APP_PANELS: readonly AppPanel[] = [
   { id: "wayback", title: "Time Machine", description: "Snapshot a site to the Wayback Machine and browse its history.", module: "network/wayback", needsSignIn: true },
   { id: "backends", title: "Backends", description: "Every storage backend ArkNetz can read and write — linked accounts, mirror failover, and ToS-aware upload routing.", module: "network/backends", needsSignIn: false },
   { id: "p2p", title: "P2P", description: "Optional peer-to-peer transport — faster site loads, live collab, mail and drive between your devices. Off by default; GitHub stays the fallback.", module: "p2p", needsSignIn: false },
+  { id: "calls", title: "Calls", description: "Encrypted voice, video, screensharing, and group calls over P2P. Off by default; calls have no GitHub fallback.", module: "p2p", needsSignIn: false },
   { id: "settings", title: "Settings", description: "IA account linking, telemetry (Strict Offline mode), ToS acceptance, backends.", module: "network/tos", needsSignIn: false },
 ];
 
@@ -208,6 +213,12 @@ export interface ArkNetzApp {
   /** The P2P collab hook for a domain, or null when P2P collab is
    *  off — the editor then runs relay-only. */
   getP2PCollabHook: (domain: string) => CollabP2PHook | null;
+  /** The Calls panel controller (lazy singleton), or null where
+   *  calls cannot run (no WebRTC here — Node, or a WebView without
+   *  it). The panel reports that honestly instead of pretending.
+   *  Null is also the state before the first call: the controller
+   *  is created once, on first use, and survives panel switches. */
+  getCallsController: () => MediaCallController | null;
 }
 
 /** Construct every phase service with shared stores. No network is used. */
@@ -267,6 +278,37 @@ export function createArkNetzApp(options: ArkNetzAppOptions = {}): ArkNetzApp {
       linked[prefix] = profile.label;
     }
     return linked;
+  };
+
+  // Calls controller (media UI phase): lazy singleton, created on
+  // first use from the browser's media stack. In Node (no
+  // RTCPeerConnection) or a WebView without WebRTC it stays null —
+  // the Calls panel then reports that calls cannot run here.
+  // The `callsHost` assignment is the structural conformance check:
+  // P2PHost must satisfy CallsHost, or this does not compile.
+  let callsController: MediaCallController | null = null;
+  let callsControllerTried = false;
+  const getCallsController = (): MediaCallController | null => {
+    if (callsControllerTried) return callsController;
+    callsControllerTried = true;
+    try {
+      if (
+        typeof RTCPeerConnection === "undefined" ||
+        typeof navigator === "undefined"
+      ) {
+        return null;
+      }
+      const callsHost: CallsHost = p2pHost;
+      callsController = new MediaCallController({
+        host: callsHost,
+        devices: browserMediaDevices(),
+        mediaFactory: new WebRtcMediaConnectionFactory(),
+        userAgent: navigator.userAgent,
+      });
+    } catch {
+      callsController = null;
+    }
+    return callsController;
   };
 
   return {
@@ -350,6 +392,7 @@ export function createArkNetzApp(options: ArkNetzAppOptions = {}): ArkNetzApp {
       if (!settings.enabled || !settings.collab) return null;
       return p2pHost.createCollabHook(domain);
     },
+    getCallsController,
     describeReadiness: () => ({
       panels: APP_PANELS.length,
       signedInPanels: APP_PANELS.filter((p) => p.needsSignIn).length,

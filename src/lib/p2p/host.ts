@@ -53,6 +53,12 @@ import { defaultP2PSettings } from "./types.js";
 import type { P2PSettings, PeerAd, SignalMessage } from "./types.js";
 import type { P2PPersistedState, P2PSettingsStore } from "./store.js";
 import { defaultP2PPersistedState } from "./store.js";
+import { CallManager } from "./call-session.js";
+import type { CallEvent, CallSession } from "./call-session.js";
+import type { CallKind, MediaControlMessage } from "./media.js";
+import { MEDIA_CHANNEL_LABEL, encodeMediaControl } from "./media.js";
+import { browserMediaDevices, type MediaDevicesLike } from "./media-devices.js";
+import { WebRtcMediaConnectionFactory, type MediaConnectionFactory } from "./media-connection.js";
 import type { BlockOp, CursorPosition } from "../collab/types.js";
 import type { CollabP2PHook, CollabP2PHookEvents } from "../collab/session.js";
 
@@ -97,6 +103,12 @@ export interface P2PHostOptions {
    *  unavailable and the GitHub path is used). Tests inject the
    *  loopback factory. */
   factory?: P2PConnectionFactory;
+  /** Media devices + media connection factory for calls. Defaults
+   *  to the browser's (browserMediaDevices() throws in Node, so the
+   *  host then reports calls unavailable — the GitHub paths are
+   *  unaffected). Tests inject the fakes. */
+  mediaDevices?: MediaDevicesLike;
+  mediaFactory?: MediaConnectionFactory;
   /** Clock injection (tests). */
   now?: () => number;
   /** Event sink (tests / diagnostics). */
@@ -156,6 +168,24 @@ export class P2PHost {
   private ownDomains: string[] = [];
   private identity: P2PIdentity | null = null;
   private manager: PeerManager | null = null;
+  /** 1:1 call routing (media UI phase). Created in
+   *  configureIdentity when the media stack exists here — null in
+   *  Node (no media devices) and before sign-in. The Calls panel
+   *  reads it through mediaAvailable()/getCallManager(). */
+  private callManager: CallManager | null = null;
+  private readonly mediaDevicesOpt?: MediaDevicesLike;
+  private readonly mediaFactoryOpt?: MediaConnectionFactory;
+  /** Handlers the Calls panel registers (stored here so they
+   *  survive the CallManager being created after sign-in). */
+  private incomingCallHandler: ((session: CallSession) => void) | null = null;
+  private unhandledMediaHandler:
+    | ((fromPeerId: string, message: MediaControlMessage) => void)
+    | null = null;
+  /** Per-session call events for the Calls panel (state, tracks,
+   *  consent, recording activity). */
+  private sessionEventHandler:
+    | ((session: CallSession, event: CallEvent) => void)
+    | null = null;
   private readonly adapters = new Map<string, PeerAdapters>();
   private readonly contactCache = new Map<string, ContactEntry | null>();
   private knownVaultIds = new Set<string>();
@@ -177,6 +207,8 @@ export class P2PHost {
         throw new Error("no registry resolver configured for P2P");
       });
     this.factory = options.factory ?? new WebRtcConnectionFactory();
+    this.mediaDevicesOpt = options.mediaDevices;
+    this.mediaFactoryOpt = options.mediaFactory;
     this.now = options.now ?? (() => Date.now());
     this.onEvent = options.onEvent;
     this.autoStart = options.autoStart ?? true;
@@ -201,7 +233,7 @@ export class P2PHost {
     this.peerId = state.peerId;
     this.ownDomains = [...state.ownDomains];
     return {
-      settings: { ...this.settings, turn: { ...this.settings.turn } },
+      settings: { ...this.settings, turn: { ...this.settings.turn }, media: { ...this.settings.media } },
       peerId: this.peerId,
       ownDomains: [...this.ownDomains],
     };
@@ -210,7 +242,7 @@ export class P2PHost {
   private async persist(): Promise<void> {
     try {
       await this.store.set({
-        settings: { ...this.settings, turn: { ...this.settings.turn } },
+        settings: { ...this.settings, turn: { ...this.settings.turn }, media: { ...this.settings.media } },
         peerId: this.peerId,
         ownDomains: [...this.ownDomains],
       });
@@ -222,7 +254,7 @@ export class P2PHost {
   }
 
   getSettings(): P2PSettings {
-    return { ...this.settings, turn: { ...this.settings.turn } };
+    return { ...this.settings, turn: { ...this.settings.turn }, media: { ...this.settings.media } };
   }
 
   getPeerId(): string {
@@ -252,12 +284,15 @@ export class P2PHost {
   /** Replace settings (the settings panel calls this). Turning the
    *  master switch off closes every connection at once; changing the
    *  TURN config recreates the manager (relay config is read at
-   *  construction), which also drops connections — the panel says so. */
+   *  construction), which also drops connections — the panel says so.
+   *  Turning media off ends every live call; turning it on attaches
+   *  the call manager to the connections that already exist. */
   setSettings(next: P2PSettings): void {
     const turnChanged =
       JSON.stringify(next.turn) !== JSON.stringify(this.settings.turn);
     const wasEnabled = this.settings.enabled;
-    this.settings = { ...next, turn: { ...next.turn } };
+    const mediaWasEnabled = this.settings.media.enabled;
+    this.settings = { ...next, turn: { ...next.turn }, media: { ...next.media } };
     void this.persist();
     if (this.manager) {
       if (turnChanged) {
@@ -271,6 +306,21 @@ export class P2PHost {
     } else if (!wasEnabled && next.enabled && this.identity) {
       this.maybeStart();
       void this.publishAd().catch(() => undefined);
+    }
+    if (this.callManager) {
+      if (mediaWasEnabled && !next.media.enabled) {
+        this.callManager.closeAll("media disabled");
+        for (const peerId of [...this.adapters.keys()]) {
+          this.callManager.detachConnection(peerId);
+        }
+      } else if (!mediaWasEnabled && next.media.enabled && this.manager) {
+        for (const [peerId, peer] of this.manager.peers) {
+          const connection = peer.connection;
+          if (connection && connection.state === "connected") {
+            this.callManager.attachConnection(connection);
+          }
+        }
+      }
     }
   }
 
@@ -314,11 +364,134 @@ export class P2PHost {
   }
 
   /** Configure (or re-configure) the identity after sign-in and
-   *  mail-keypair creation. Creates the PeerManager on first call. */
+   *  mail-keypair creation. Creates the PeerManager on first call.
+   *  Also creates the CallManager when the media stack exists on
+   *  this device — in Node (no media devices) it stays null and
+   *  mediaAvailable() is false, which the Calls panel reports
+   *  honestly instead of pretending calls work. */
   configureIdentity(identity: P2PIdentity): void {
     this.identity = { ...identity };
     if (!this.manager) this.createManager();
+    if (!this.callManager) {
+      try {
+        const devices = this.mediaDevicesOpt ?? browserMediaDevices();
+        const mediaFactory = this.mediaFactoryOpt ?? new WebRtcMediaConnectionFactory();
+        this.callManager = new CallManager({
+          selfPeerId: this.peerId,
+          selfAddress: identity.address,
+          devices,
+          mediaFactory,
+          iceServers: this.mediaIceServers(),
+          sendControl: (peerId, message) => {
+            this.sendMediaControlTo(peerId, message);
+          },
+          onIncomingCall: (session) => {
+            this.incomingCallHandler?.(session);
+          },
+          onUnhandledControl: (peerId, message) => {
+            this.unhandledMediaHandler?.(peerId, message);
+          },
+          onSessionEvent: (session, event) => {
+            this.sessionEventHandler?.(session, event);
+          },
+        });
+      } catch {
+        // No media stack here (Node, or a WebView without WebRTC):
+        // calls are unavailable, everything else is unaffected.
+        this.callManager = null;
+      }
+    }
     this.maybeStart();
+  }
+
+  // -- calls (media UI phase) -------------------------------------------
+
+  /** The 1:1 call router, or null when calls cannot run here. */
+  getCallManager(): CallManager | null {
+    return this.callManager;
+  }
+
+  /** True when a call can be placed right now: identity configured,
+   *  media stack present, master switch + media switch on. */
+  mediaAvailable(): boolean {
+    return (
+      this.callManager !== null &&
+      this.identity !== null &&
+      this.settings.enabled &&
+      this.settings.media.enabled
+    );
+  }
+
+  /** ICE servers for media peer connections (same assembly as the
+   *  data transport: STUN always, TURN when enabled). */
+  mediaIceServers(): RTCIceServer[] {
+    return assembleIceServers(this.getSettings(), this.ownTurnServers()).iceServers;
+  }
+
+  /** The Calls panel registers its ringing-call handler here (stored
+   *  so it survives the CallManager being created after sign-in). */
+  setIncomingCallHandler(
+    handler: ((session: CallSession) => void) | null,
+  ): void {
+    this.incomingCallHandler = handler;
+  }
+
+  /** The group-call negotiator registers here: media control no 1:1
+   *  session owns (group/mixer control, group media legs). */
+  setUnhandledMediaHandler(
+    handler: ((fromPeerId: string, message: MediaControlMessage) => void) | null,
+  ): void {
+    this.unhandledMediaHandler = handler;
+  }
+
+  /** The Calls panel registers here: every event of every 1:1
+   *  session, with the session attached (state, remote tracks,
+   *  consent, recording activity). */
+  setSessionEventHandler(
+    handler: ((session: CallSession, event: CallEvent) => void) | null,
+  ): void {
+    this.sessionEventHandler = handler;
+  }
+
+  /** Send one media control message to a connected peer (over the
+   *  `arknetz/media` channel of its data connection). False when
+   *  there is no connection to that peer — the caller falls back
+   *  (a call to an offline peer is not a call). */
+  sendMediaControlTo(peerId: string, message: MediaControlMessage): boolean {
+    const connection = this.manager?.connectionFor(peerId);
+    if (!connection) return false;
+    try {
+      const channel = connection.createChannel(MEDIA_CHANNEL_LABEL);
+      channel.send(encodeMediaControl(message));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Broadcast one media control message to every connected peer
+   *  (group/mixer control). Returns how many peers received it. */
+  broadcastMediaControl(message: MediaControlMessage): number {
+    if (!this.manager) return 0;
+    let sent = 0;
+    for (const peerId of [...this.manager.peers.keys()]) {
+      if (this.sendMediaControlTo(peerId, message)) sent++;
+    }
+    return sent;
+  }
+
+  /** Create (but do not start) a 1:1 call session to a connected
+   *  peer. Null when calls are off or the peer is not connected —
+   *  the caller then reports the peer unreachable. The caller
+   *  awaits `session.start()`. */
+  startCallSession(
+    peerId: string,
+    address: string,
+    kind: CallKind,
+  ): CallSession | null {
+    if (!this.callManager || !this.mediaAvailable()) return null;
+    if (!this.manager?.isConnected(peerId)) return null;
+    return this.callManager.startCall(peerId, address, kind);
   }
 
   /** The mail envelope handler: the shell sets this when a mail
@@ -537,6 +710,12 @@ export class P2PHost {
           const peer = this.manager?.peers.get(event.peerId);
           const connection = this.manager?.connectionFor(event.peerId);
           if (peer && connection) this.attachAdapters(event.peerId, peer.ad, connection);
+        } else if (event.type === "peer-disconnected") {
+          // Drop the adapters AND the call router for the dead
+          // connection — a stale CallManager entry would keep
+          // routing invites at a peer that is gone.
+          this.detachAdapters(event.peerId);
+          this.callManager?.detachConnection(event.peerId);
         }
         this.onEvent?.(event);
       },
@@ -552,6 +731,12 @@ export class P2PHost {
         this.manager.disconnect(peerId, "P2P settings changed");
       }
       this.adapters.clear();
+      // Calls end with the connections (peer ID rotated or TURN
+      // changed): end the sessions first, then detach the router.
+      this.callManager?.closeAll("p2p reset");
+      for (const peerId of [...this.manager.peers.keys()]) {
+        this.callManager?.detachConnection(peerId);
+      }
     }
     this.manager = null;
     if (this.identity) this.createManager();
@@ -690,6 +875,16 @@ export class P2PHost {
       adapters.mail.attach(connection);
     }
     this.adapters.set(peerId, adapters);
+    // Calls ride the same connection: attach the call router when
+    // media is on (it opens the arknetz/media channel). When media
+    // is off the channel is never opened — no invite can arrive.
+    if (
+      this.callManager &&
+      this.settings.enabled &&
+      this.settings.media.enabled
+    ) {
+      this.callManager.attachConnection(connection);
+    }
   }
 
   private detachAdapters(peerId: string): void {

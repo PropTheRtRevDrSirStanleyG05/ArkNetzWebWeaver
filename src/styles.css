@@ -187,3 +187,25 @@ pre.an-ed-text{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px
    .an-panels block above (B2). */
 .an-panel-btn{padding:4px 8px;border:1px solid #d1d5db;background:#fff;border-radius:6px;cursor:pointer;font-size:13px}
 .an-panel-btn[aria-selected="true"]{background:#111827;color:#fff;border-color:#111827}
+
+/* Calls panel (media UI wiring, 2026-11-21): video tiles as a
+   responsive grid — without this the tiles stack full-width with
+   default-size video boxes, a long empty wall at 6 participants.
+   Ringing and the mixer banner read as notices, not plain text. */
+.calls-videos,.calls-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.5rem;margin:.5rem 0}
+.calls-video-tile{min-width:0;overflow-wrap:break-word}
+.calls-video-tile video{width:100%;aspect-ratio:16/9;background:#111827;border-radius:6px;display:block}
+.calls-video-tile p{margin:.25rem 0;font-size:.9rem}
+.calls-controls{display:flex;flex-wrap:wrap;gap:.4rem;margin:.5rem 0}
+.calls-incoming{border:2px solid #2563eb;background:#eff6ff;border-radius:6px;padding:.75rem;margin:.5rem 0}
+.calls-incoming p{margin:.25rem 0}
+.calls-mixer{border:1px solid #d97706;background:#fffbeb;border-radius:6px;padding:.5rem .75rem}
+.calls-recording-on{color:#b91c1c;font-weight:700}
+.calls-diagnostics{color:#4b5563;font-size:.9rem}
+.calls-note{color:#4b5563;font-size:.9rem}
+.calls-error{color:#b91c1c;font-weight:700}
+.calls-peers{list-style:none;padding:0;margin:.5rem 0}
+.calls-peers li{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;margin:.35rem 0}
+.calls-peers li span{min-width:0;overflow-wrap:break-word;flex:1}
+.calls-by-address{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:.5rem 0}
+.calls-by-address input{flex:1;min-width:12rem}

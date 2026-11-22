@@ -1143,7 +1143,8 @@ recipient can read the payload.
 ### 16.3 Transport — data channels and framing
 
 - **Channels:** one negotiated data channel per adapter
-  (`arknetz/<adapter>`, e.g. `arknetz/site`), over a real
+  (`arknetz/<adapter>`, e.g. `arknetz/site`), plus one media
+  channel, `arknetz/media` (§17), over a real
   `RTCPeerConnection` in the browser. Every message on a data
   channel is one frame: `[ type: u8 ][ payload ]` — `0x01` = JSON
   control message, `0x02` = chunk frame. The 16 KiB cap keeps every
@@ -1311,3 +1312,140 @@ recipient can read the payload.
 - **Timers (host):** signal poll 30 s, ad republish 15 min, silence
   check 60 s. All start only once identity is configured and the
   master switch is on.
+
+## 17. Real-time media — voice, video, screenshare (optional, off by default)
+
+Merged from MEDIA-SPEC.md §2 (call control messages), §3
+(1:1 call lifecycle), §6 (group calls + mixer), §9 (limits).
+The full spec lives in `MEDIA-SPEC.md` at the repo root of the
+client; this section is the normative protocol summary. Media
+is a **live-call accelerator on the P2P transport of §16** —
+voice, video, and screenshare over WebRTC, plus group calls
+with a peer-volunteered mixer. Like all of P2P it is off by
+default, and unlike the data features **it has no GitHub
+fallback: if a pair cannot connect directly and has no working
+relay, that call cannot connect**, and the UI says so plainly
+instead of failing silently.
+
+### 17.1 Media channel and 1:1 call messages
+
+- **Channel:** `arknetz/media`, a data channel on the existing
+  P2P connection (the same `RTCPeerConnection` as the data
+  channels — a call can only start once the data connection is
+  already up). Frames follow §16.3 (`0x01` = JSON control
+  message). Media itself (audio/video/screen tracks) flows on
+  a **separate** `RTCPeerConnection` per call, negotiated over
+  this channel.
+- **Call identity:** `callId` is `call-<32 hex>`, unique per
+  call; all messages of one call share it. A message for an
+  unknown `callId` is ignored.
+- **1:1 messages (`t`):** `call-invite` (`callId`,
+  `fromPeerId`, `fromAddress`, `kind`: `voice` | `video`, `at`)
+  — starts ringing on the callee; `call-offer` / `call-answer`
+  (`callId`, `sdp`); `call-ice` (`callId`, `candidate`);
+  `call-accept` (`callId`); `call-decline` (`callId`,
+  `reason?`); `call-bye` (`callId`, `reason?`); `call-mute`
+  (`callId`, `fromPeerId`, `audio`: bool); `call-video`
+  (`callId`, `fromPeerId`, `video`: bool); `call-screen`
+  (`callId`, `fromPeerId`, `sharing`: bool); `call-quality`
+  (`callId`, `fromPeerId`, `mode`: `full` | `audio-only`);
+  `record-consent` (`callId`, `fromPeerId`, `recording`: bool);
+  `recording-active` (`callId`, `fromPeerId`, `active`: bool).
+- **Lifecycle:** invite → ringing → accept → offer/answer/ICE
+  → connected. One call per device at a time in v1: any active
+  session (ringing, connecting, connected, inviting) means
+  busy, and a second invite from any peer is declined with
+  `busy`. A call that is not answered is declined after the
+  ringing timeout. Either side ends it with `call-bye`.
+- **Quality:** each side reports its own stats on a 2 s
+  cadence (`lastDiagnostics`); when a side degrades to
+  audio-only it sends `call-quality`, so the other side shows
+  it. The call diagnostics line names the ICE path
+  (host/srflx/relayed) and, when relayed, says so plainly.
+  Degradation never ends a call on its own.
+
+### 17.2 Group calls — mesh, then a volunteer mixer
+
+- **Group identity:** `groupId` is `group-<32 hex>`, unique
+  per group call. The group creator is the **coordinator**
+  (longest-joined member; on a coordinator leaving, the
+  longest-joined remaining member takes over).
+- **Mesh up to 5:** at 5 or fewer participants every member
+  holds a direct media leg to every other member (full mesh).
+  Back to mesh when the group shrinks to 5 again.
+- **Mixer past 5:** at 6 or more participants the coordinator
+  elects a **mixer** from the members who volunteered
+  (`volunteerMixer`, off by default). The mixer is a
+  selective-forwarding unit: every member sends its tracks to
+  the mixer, the mixer forwards them to the rest. Election
+  picks the best score (uplink + CPU headroom, re-announced on
+  change) and switches only past a 0.1 margin, so near-equal
+  volunteers do not flap the group mid-call. A member that
+  joins *after* the election is told who the mixer is by the
+  coordinator as part of the join relay.
+- **Group messages (`t`):** `group-join` (`groupId`, `peerId`,
+  `address`, `volunteerMixer`, `uplinkKbps?`, `cpuHeadroom?`);
+  `group-leave` (`groupId`, `peerId`); `mixer-announce`
+  (`groupId`, `peerId`, `score`, `volunteer` — re-sent on score
+  change); `mixer-elect` (`groupId`, `mixerPeerId`,
+  `electedBy`); `mixer-ready` (`groupId`, `mixerPeerId`);
+  `mixer-lost` (`groupId`, `mixerPeerId`, `reason`);
+  `no-volunteer` (`groupId` — the coordinator found no
+  volunteer past the mesh ceiling; the group stays in mesh and
+  every participant is told why). Group call setup between two
+  members uses `group-invite` / `group-decline` /
+  `group-offer` / `group-answer` / `group-ice`.
+- **Mixer leaves / degrades:** the remaining members re-elect
+  while still above 5 participants. If the group has shrunk to
+  5, it falls back to mesh instead — re-election only applies
+  above the ceiling.
+- **No volunteer:** the group stays in mesh past the ceiling
+  and says so. A call never fails for lack of a mixer; it
+  degrades.
+
+### 17.3 The mixer trust boundary — read this before volunteering
+
+**A selective-forwarding mixer is NOT a blind forwarder.** It
+terminates DTLS-SRTP per leg and holds the SRTP keys, so it
+**can access the media it forwards**. The UI never claims
+otherwise: wherever a mixer is involved it shows who the mixer
+is, with the trust note, and a member who is the mixer sees
+"You are the mixer" — the role is always visible, opt-in, and
+revocable (turn the volunteer toggle off and the next election
+skips you). The real fix for mixer access is SFrame /
+insertable-streams end-to-end encryption; that is future work,
+not built. Until then the mitigation is visibility and choice,
+not a false blindness claim.
+
+### 17.4 Recording — local only, all-party consent
+
+- Recording is **local only**: `MediaRecorder` on the local
+  composite (local mic + remote audio, video if present),
+  saved to a file on the recording peer's device. No
+  server-side recording, nothing uploaded anywhere.
+- Recording starts only when **every** participant has sent
+  `record-consent { recording: true }`. A participant who has
+  not consented — or who withdraws consent mid-recording
+  (`record-consent { recording: false }`) — stops the
+  recording immediately on the recording peer. Silence is never
+  consent, and a client that does not speak the consent message
+  counts as not consenting.
+- The recorder announces state with `recording-active` when it
+  starts and stops, so **every** participant sees a persistent
+  recording indicator while recording is active. A recording no
+  participant can see is a bug, not a feature.
+
+### 17.5 Screenshare and limits
+
+- **Screenshare:** desktop only, via `getDisplayMedia`. On
+  Android the button is **disabled** with the reason shown in
+  plain words (the MediaProjection bridge is not built) — it is
+  never faked as working.
+- **Limits:** Stanley's position (2026-11-21 14:55) applies
+  here as in §16 — no quota budgeting, no relay rationing. The
+  512 KiB/s token bucket is a user-adjustable default
+  (0 = unlimited) on the data path and does not apply to live
+  media tracks at all. A shared relay that stops relaying is
+  graceful degradation for data features; for a live call it is
+  the one hard failure — the call cannot connect, and the UI
+  says so. The answer is bring-your-own TURN, not rationing.

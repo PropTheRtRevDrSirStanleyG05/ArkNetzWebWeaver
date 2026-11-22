@@ -2749,3 +2749,138 @@ its `assert.rejects` handler attached *before* the flush, or
 Node reports an unhandled rejection; a test that fails before
 `session.end()` leaves the 2 s quality-monitor interval alive
 and the `node --test` file process never exits.
+
+## Real-time media — UI wiring (Calls panel + settings), 2026-11-21
+
+MEDIA-SPEC.md §11, done. New file `src/lib/p2p/call-panel.ts`
+(`MediaCallController` + `renderCallsPanelHtml` + `mountCallsPanel`);
+Calls is the 17th panel (`src/lib/panels.ts` case `"calls"` +
+`src/lib/app.ts` `APP_PANELS` + lazy `getCallsController()`); the
+P2P settings panel gained a "Calls (real-time media)" section
+(`src/lib/p2p/panel.ts`).
+
+**What is wired**
+
+- **Calls panel:** idle peer list from P2P presence (Voice/Video
+  buttons + Group checkboxes + "Call by address" input, draft
+  survives re-renders); incoming 1:1 ringing UI (Answer/Decline,
+  caller named from the invite's `fromAddress`); active 1:1 view
+  (remote video + local preview + PiP, mute / video on-off /
+  camera switch / screen share / leave, diagnostics line naming
+  the ICE path host/srflx/relayed, relay warning when relayed,
+  no-GitHub-fallback line); group view (mode line, participant
+  tiles with mixer/volunteer badges, leave, invite-more row).
+- **P2P settings additions:** media on/off + voice / video /
+  groups / screenShare / volunteerMixer toggles, all off by
+  default, with the volunteer trust note and the relay warning
+  line. Media settings live on `P2PSettings` itself
+  (`media: MediaSettings` in `src/lib/p2p/types.ts`); the media
+  core re-exports them (it cannot own them without a module
+  cycle). The host (`src/lib/p2p/host.ts`) owns the CallManager,
+  attaches it when media is on, closes all calls when media is
+  switched off, and detaches it on peer disconnect.
+- **Mixer identity always visible:** a mixer-routed group shows
+  "This call is routed through a volunteer mixer (peer-X)" plus
+  the trust note ("The mixer can technically access the media it
+  forwards — it terminates the encrypted media session on each
+  leg…"), and "You are the mixer" when it is you. The mixer is
+  NEVER claimed to be blind anywhere in the UI or PROTOCOL.md.
+- **Recording:** record button disabled until every participant
+  has consented (silence is never consent; withdrawal stops the
+  recording and announces it); persistent red "● Recording"
+  indicator on every participant's side. New control message
+  `recording-active` (`{ callId, fromPeerId, active }`, MEDIA-SPEC
+  §2.1/§8): consent alone cannot signal state, because a
+  consenting participant is not told when recording actually
+  starts.
+- **Android screen share:** the button is DISABLED with the stub
+  reason in plain words (MediaProjection bridge missing) — never
+  faked as working.
+- **PROTOCOL.md §17:** merged from MEDIA-SPEC §2/§3/§6/§9 +
+  the mixer trust boundary (§17.3) + `arknetz/media` added to
+  the §16.3 channel list.
+- **Calls CSS** (`src/styles.css`, `.calls-*`): responsive tile
+  grid (16:9 dark video boxes), ringing + mixer banner as
+  notices, red recording indicator. Without it the tiles stacked
+  full-width as a long empty wall (caught by the screenshot pass).
+- **Nav badge:** the Calls nav button reads "Calls • ringing"
+  while a 1:1 call or group invite is ringing — but only while
+  the Calls panel is mounted. A call arriving while another panel
+  is showing has no global ringer yet (known gap, not hidden).
+- **In mixer mode the mixer forwards but does not render other
+  participants' video tiles** (v1 — `GroupCall.onRemoteTrack`
+  forwards instead of firing `remote-track` when self is mixer).
+- Group invites from any member work via the coordinator relay,
+  but if the coordinator itself is unreachable the join only
+  reaches the inviter.
+
+**Bugs the battery caught and fixed (all in the media core /
+controller, all with tests)**
+
+1. `CallSession.start()` sent `call-invite` with an empty
+   `fromAddress` — the ringing UI could never name the caller.
+   `CallSession` now carries its own address
+   (`CallSessionOptions.selfAddress`, plumbed from
+   `CallManager.selfAddress`).
+2. `replaceVideoTrack()` never sent `call-screen`, so the remote
+   side never learned a screen share started or stopped, despite
+   MEDIA-SPEC §5.1 requiring it. It now sends
+   `call-screen { sharing }` on share and on restore.
+3. `GroupCall.updateMode()` dropped a coordinator-elected mixer
+   on every join: a late joiner learns the mixer (mixer-elect)
+   before it learns the full membership, and its own stale-small
+   size fell back to mesh. `updateMode(shrank)` now clears the
+   mixer only on a real shrink (a leave, or a lost mixer); the
+   mesh fallback at ≤ 5 members is otherwise kept. A mixer
+   leaving a group that drops to 5 does NOT trigger re-election —
+   §6.1 says the group falls back to mesh at ≤ 5; re-election
+   only applies while still above 5 (the test now runs 7 peers).
+4. The coordinator never told a member joining *after* the
+   election who the mixer is (the election broadcast went out on
+   the join that pushed the group past 5). The coordinator now
+   sends `mixer-elect` directly to a late joiner as part of the
+   join relay.
+5. New control message `no-volunteer` (MEDIA-SPEC §2.2/§6.3):
+   only the coordinator runs the election, so without a broadcast
+   the other members never saw the notice. The coordinator now
+   broadcasts it, and the controller routes it to
+   `group.handleControl` (the broadcast was initially dropped by
+   the controller's message switch on arrival).
+6. The panel misdiagnosed a guest as "no WebRTC": a controller
+   exists only where WebRTC exists, so `available: false` inside
+   the renderer means "no P2P identity yet", not "no WebRTC"
+   (headless Chrome HAS WebRTC and still hit the branch). The
+   renderer now shows the sign-in copy there; the no-WebRTC copy
+   stays only on the no-controller path (`panels.ts`).
+
+**Verification**
+
+- Full battery: **804 tests, 804 pass, 0 fail** (was 770 at the
+  P2P phase-2 baseline; +34 in `tests/p2p-call-panel.test.ts`:
+  settings defaults/normalize/store round-trip, P2P panel media
+  section, renderer states, 1:1 over loopback pairs incl.
+  recording consent gating + withdrawal + desktop screen share +
+  Android refusal, 6-person election, 6-person no-volunteer,
+  7-person mixer-leaves re-election, 6→5 shrink-to-mesh, host
+  integration, mount behaviour). `npx tsc --noEmit` exit 0.
+- Screenshots: `~/workspace/arknetzwebweaver/qa-screenshots/media-ui/`
+  (14 PNGs, read back) — live Calls panel + P2P media section at
+  desktop and 390px, plus five static state snapshots (ringing,
+  active desktop, active Android-relayed, group mixer, group
+  self-mixer) at desktop and 390px, from
+  `scripts/media-ui-snapshots.mjs` + `scripts/media-ui-shots.mjs`
+  (CDP over Node 24 WebSocket, same pattern as
+  `scripts/p2p-panel-shots.mjs`; the harness deletes
+  `dist/.media-shots/` after). **Zero horizontal overflow at
+  every width** (scrollWidth == clientWidth on all 14), no
+  clipped controls, mixer identity + trust note visible in the
+  group shots, recording indicator + relayed diagnostics +
+  disabled Android screen-share button visible in the
+  active-Android shot, corrected sign-in copy visible in the
+  live Calls shots.
+- Still needs a real device: real WebRTC peer connections (any
+  surface), a 6-person group with a volunteer mixer, a mixer
+  leaving mid-call, a symmetric-NAT pair with and without BYO
+  TURN, Android screen-share button correctly disabled — the
+  loopback/fake-peer double proves the control flow, not the
+  media path.

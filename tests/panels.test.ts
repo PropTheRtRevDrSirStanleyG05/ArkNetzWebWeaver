@@ -154,10 +154,10 @@ test("panels: moderation nav button hidden for guests and non-masters, shown for
   assert.equal(panelVisibleForLogin(moderation, MASTER_GITHUB_USER), true);
   assert.equal(MASTER_GITHUB_USER, "PropTheRtRevDrSirStanleyG05");
   const guestVisible = visiblePanelsForLogin(APP_PANELS, null);
-  assert.equal(guestVisible.length, 15);
+  assert.equal(guestVisible.length, 16);
   assert.equal(guestVisible.some((p) => p.id === "moderation"), false);
   const masterVisible = visiblePanelsForLogin(APP_PANELS, MASTER_GITHUB_USER);
-  assert.equal(masterVisible.length, 16);
+  assert.equal(masterVisible.length, 17);
   assert.equal(masterVisible.some((p) => p.id === "moderation"), true);
   // Every other panel stays visible to guests — guest browsing is the
   // default and hiding moderation must not hide anything else.

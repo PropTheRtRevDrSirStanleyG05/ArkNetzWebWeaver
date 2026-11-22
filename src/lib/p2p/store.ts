@@ -13,8 +13,8 @@
 // with a fresh one — never derived from a login or address.
 
 import { generatePeerId, isValidPeerId } from "./identity.js";
-import { defaultP2PSettings } from "./types.js";
-import type { P2PSettings } from "./types.js";
+import { defaultMediaSettings, defaultP2PSettings } from "./types.js";
+import type { MediaSettings, P2PSettings } from "./types.js";
 
 /** Everything P2P persists per device. */
 export interface P2PPersistedState {
@@ -46,6 +46,18 @@ export function normalizeP2PSettings(raw: unknown): P2PSettings {
     typeof s[key] === "boolean" ? (s[key] as boolean) : fallback;
   const turnRaw =
     typeof s.turn === "object" && s.turn !== null ? (s.turn as Record<string, unknown>) : {};
+  const mediaRaw =
+    typeof s.media === "object" && s.media !== null ? (s.media as Record<string, unknown>) : {};
+  const mediaBool = (key: string, fallback: boolean): boolean =>
+    typeof mediaRaw[key] === "boolean" ? (mediaRaw[key] as boolean) : fallback;
+  const media: MediaSettings = {
+    enabled: mediaBool("enabled", defaultMediaSettings().enabled),
+    voice: mediaBool("voice", defaultMediaSettings().voice),
+    video: mediaBool("video", defaultMediaSettings().video),
+    groups: mediaBool("groups", defaultMediaSettings().groups),
+    screenShare: mediaBool("screenShare", defaultMediaSettings().screenShare),
+    volunteerMixer: mediaBool("volunteerMixer", defaultMediaSettings().volunteerMixer),
+  };
   return {
     enabled: bool("enabled", d.enabled),
     sites: bool("sites", d.sites),
@@ -81,6 +93,7 @@ export function normalizeP2PSettings(raw: unknown): P2PSettings {
           ? turnRaw.useOpenRelayDemo
           : d.turn.useOpenRelayDemo,
     },
+    media,
   };
 }
 
@@ -118,21 +131,21 @@ export function createMemoryP2PStore(
   return {
     async get() {
       return {
-        settings: { ...current.settings, turn: { ...current.settings.turn } },
+        settings: { ...current.settings, turn: { ...current.settings.turn }, media: { ...current.settings.media } },
         peerId: current.peerId,
         ownDomains: [...current.ownDomains],
       };
     },
     async set(next) {
       current = {
-        settings: { ...next.settings, turn: { ...next.settings.turn } },
+        settings: { ...next.settings, turn: { ...next.settings.turn }, media: { ...next.settings.media } },
         peerId: next.peerId,
         ownDomains: [...next.ownDomains],
       };
     },
     peek() {
       return {
-        settings: { ...current.settings, turn: { ...current.settings.turn } },
+        settings: { ...current.settings, turn: { ...current.settings.turn }, media: { ...current.settings.media } },
         peerId: current.peerId,
         ownDomains: [...current.ownDomains],
       };

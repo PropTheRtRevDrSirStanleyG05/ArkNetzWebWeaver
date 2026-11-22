@@ -11,6 +11,7 @@
 import type { P2PSettings } from "./types.js";
 import type { IceDiagnostics } from "./ice.js";
 import { P2P_FREETURN_NOTE, P2P_NO_ACCOUNT_NOTE, P2P_OPENRELAY_DEMO_NOTE, P2P_RELAY_PRIVACY_NOTE } from "./ice.js";
+import { CALL_NO_RELAY_NOTE, CALL_RELAYED_NOTE, MIXER_VOLUNTEER_NOTE } from "./media.js";
 import { defaultP2PSettings } from "./types.js";
 
 export const P2P_PANEL_ID = "p2p";
@@ -128,6 +129,54 @@ export function renderP2PPanelHtml(deps: P2PPanelDeps): string {
       ),
   );
 
+  const media = section(
+    "Calls (real-time media)",
+    featureToggle(
+      "an-p2p-toggle-media",
+      "voice, video and group calls",
+      "Encrypted calls over P2P — 1:1 voice/video and group calls up to the mixer threshold. Off by default; the Calls panel appears when this is on.",
+      settings.media.enabled,
+      masterOn,
+    ) +
+      featureToggle(
+        "an-p2p-toggle-media-voice",
+        "voice calls",
+        "1:1 voice calls to connected peers, or by protocol address.",
+        settings.media.voice,
+        masterOn && settings.media.enabled,
+      ) +
+      featureToggle(
+        "an-p2p-toggle-media-video",
+        "video calls",
+        "1:1 video calls, including the local preview and picture-in-picture.",
+        settings.media.video,
+        masterOn && settings.media.enabled,
+      ) +
+      featureToggle(
+        "an-p2p-toggle-media-groups",
+        "group calls",
+        "Group calls: mesh up to 5 people, then a volunteer mixer. Joining is opt-in — nobody is pulled into a group call silently.",
+        settings.media.groups,
+        masterOn && settings.media.enabled,
+      ) +
+      featureToggle(
+        "an-p2p-toggle-media-screen",
+        "screen sharing",
+        "Share your screen in a call (desktop only — on Android the button is disabled, because screen capture needs a native MediaProjection bridge that is not built).",
+        settings.media.screenShare,
+        masterOn && settings.media.enabled,
+      ) +
+      featureToggle(
+        "an-p2p-toggle-media-mixer",
+        "volunteer as a group-call mixer",
+        MIXER_VOLUNTEER_NOTE,
+        settings.media.volunteerMixer,
+        masterOn && settings.media.enabled,
+      ) +
+      `<p class="an-note">${esc(CALL_NO_RELAY_NOTE)}</p>` +
+      `<p class="an-note">${esc(CALL_RELAYED_NOTE)}</p>`,
+  );
+
   const identity = section(
     "This device",
     `<p>Peer ID: <code>${esc(deps.peerId)}</code></p>` +
@@ -170,7 +219,7 @@ export function renderP2PPanelHtml(deps: P2PPanelDeps): string {
       `<p class="an-note">ICE servers in effect: ${deps.iceServersInEffect.length ? esc(deps.iceServersInEffect.join(", ")) : "none"}</p>`,
   );
 
-  return h + intro + features + identity + turn + privacy + diagnostics;
+  return h + intro + features + media + identity + turn + privacy + diagnostics;
 }
 
 /**
@@ -188,6 +237,7 @@ export function mountP2PPanel(root: HTMLElement, deps: P2PPanelDeps): void {
       const next: P2PSettings = {
         ...settings,
         turn: { ...settings.turn, urls: [...settings.turn.urls] },
+        media: { ...settings.media },
       };
       mutate(next);
       settings = next;
@@ -210,6 +260,19 @@ export function mountP2PPanel(root: HTMLElement, deps: P2PPanelDeps): void {
     featureBtn("an-p2p-toggle-mail", "mail");
     featureBtn("an-p2p-toggle-drive", "drive");
     featureBtn("an-p2p-toggle-serve", "serveSites");
+    const mediaBtn = (id: string, key: "enabled" | "voice" | "video" | "groups" | "screenShare" | "volunteerMixer"): void => {
+      $(id)?.addEventListener("click", () =>
+        flip((next) => {
+          next.media[key] = !next.media[key];
+        }),
+      );
+    };
+    mediaBtn("an-p2p-toggle-media", "enabled");
+    mediaBtn("an-p2p-toggle-media-voice", "voice");
+    mediaBtn("an-p2p-toggle-media-video", "video");
+    mediaBtn("an-p2p-toggle-media-groups", "groups");
+    mediaBtn("an-p2p-toggle-media-screen", "screenShare");
+    mediaBtn("an-p2p-toggle-media-mixer", "volunteerMixer");
     $("an-p2p-toggle-turn")?.addEventListener("click", () =>
       flip((next) => {
         next.turn.enabled = !next.turn.enabled;

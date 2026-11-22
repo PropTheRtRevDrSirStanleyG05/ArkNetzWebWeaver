@@ -1,4 +1,4 @@
-// Panels — mounts the 16 phase panels into the shell.
+// Panels — mounts the 17 phase panels into the shell.
 // This is the single integration hook for phases 1–4: the app is
 // constructed once (createArkNetzApp) and every panel renders from the
 // real phase services, not from placeholders. Where a panel needs a
@@ -28,6 +28,7 @@ import {
 import { renderStatsPanelHtml, mountStatsPanel } from "./viewer/stats-panel.js";
 import { renderP2PPanelHtml, mountP2PPanel } from "./p2p/panel.js";
 import type { P2PPanelDeps } from "./p2p/panel.js";
+import { CALLS_NO_WEBRTC_COPY, mountCallsPanel, renderCallsPanelHtml } from "./p2p/call-panel.js";
 import { defaultTelemetrySettings, emptyStats } from "./viewer/stats.js";
 import type { SiteStats, TelemetrySettings } from "./viewer/stats.js";
 import { bundleSummary, packSiteOffline } from "./viewer/offline.js";
@@ -369,6 +370,14 @@ export async function renderPanelHtml(
       // renderP2PPanelHtml carries its own <h2>P2P</h2>.
       return renderP2PPanelHtml(await p2pDeps(app));
     }
+    case "calls": {
+      // renderCallsPanelHtml carries its own <h2>Calls</h2>. No
+      // controller here (Node, or a WebView without WebRTC) means
+      // the panel says calls cannot run, instead of pretending.
+      const controller = app.getCallsController();
+      if (!controller) return h + note(CALLS_NO_WEBRTC_COPY);
+      return renderCallsPanelHtml(controller.viewModel());
+    }
     case "settings":
       return h + note("Internet Archive and GitHub settings live in the sidebar on the left — link IA keys there to enable stealth upload, and sign in with GitHub to enable Publish.");
     default:
@@ -704,6 +713,10 @@ export async function wirePanel(
         void app.resetP2PPeerId().catch(() => undefined);
       },
     });
+  }
+  if (panelId === "calls") {
+    const controller = app.getCallsController();
+    if (controller) mountCallsPanel(root, controller);
   }
 }
 
