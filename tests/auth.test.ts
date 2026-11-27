@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import {
   GITHUB_AUTHORIZE_URL,
   buildAuthorizeUrl,
+  fetchGithubUser,
+  friendlySignInError,
   handleRedirect,
   isMasterUser,
   randomState,
@@ -170,4 +172,179 @@ test("completeDeviceSignIn reads the token owner's login (mock user lookup)", as
   });
   assert.equal(got.token, "gho_token123");
   assert.equal(got.user.login, "PropTheRtRevDrSirStanleyG05");
+});
+
+// --- Device flow via Tauri Rust commands (hunt 5) ------------------------
+// Hunt 5 root cause: GitHub's login endpoints send no
+// Access-Control-Allow-Origin header, so window.fetch from the WebView
+// throws a bare "Failed to fetch" even though GitHub answers HTTP 200.
+// The fix routes both device-flow POSTs through the Rust commands
+// github_device_code / github_device_token (no CORS in Rust).
+// These tests install a mock __TAURI__ and a fetch that FAILS LOUDLY
+// if touched, so any regression back to fetch fails the test instead
+// of silently passing.
+
+type TauriInvokeFn = (cmd: string, args?: unknown) => Promise<unknown>;
+
+function installMockTauri(invoke: TauriInvokeFn): {
+  calls: { cmd: string; args: unknown }[];
+  restore: () => void;
+} {
+  const scope = globalThis as unknown as Record<string, unknown>;
+  const prevTauri = scope.__TAURI__;
+  const prevFetch = globalThis.fetch;
+  const calls: { cmd: string; args: unknown }[] = [];
+  scope.__TAURI__ = {
+    core: {
+      invoke: async (cmd: string, args?: unknown) => {
+        calls.push({ cmd, args });
+        return invoke(cmd, args);
+      },
+    },
+  };
+  globalThis.fetch = (async () => {
+    throw new Error("fetch must not be used when __TAURI__ is present");
+  }) as unknown as typeof fetch;
+  return {
+    calls,
+    restore: () => {
+      if (prevTauri === undefined) delete scope.__TAURI__;
+      else scope.__TAURI__ = prevTauri;
+      globalThis.fetch = prevFetch;
+    },
+  };
+}
+
+test("hunt 5: requestDeviceCode uses github_device_code (invoke) when __TAURI__ is present — fetch never called", async () => {
+  const { calls, restore } = installMockTauri(async (cmd) => {
+    assert.equal(cmd, "github_device_code");
+    return {
+      device_code: "dev-9",
+      user_code: "WXYZ-1234",
+      verification_uri: "https://github.com/device",
+      expires_in: 900,
+      interval: 5,
+    };
+  });
+  try {
+    const got = await requestDeviceCode("Iv1.testclient");
+    assert.equal(got.deviceCode, "dev-9");
+    assert.equal(got.userCode, "WXYZ-1234");
+    assert.equal(got.verificationUri, "https://github.com/device");
+    assert.equal(got.expiresIn, 900);
+    assert.equal(got.interval, 5);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0]?.args, { client_id: "Iv1.testclient", scope: "read:user public_repo" });
+  } finally {
+    restore();
+  }
+});
+
+test("hunt 5: requestDeviceCode maps the Rust path's device_flow_disabled to the exact fix", async () => {
+  const { restore } = installMockTauri(async () => ({ error: "device_flow_disabled" }));
+  try {
+    await assert.rejects(() => requestDeviceCode("Iv1.testclient"), /Enable Device Flow/);
+  } finally {
+    restore();
+  }
+});
+
+test("hunt 5: requestDeviceCode still uses an explicitly passed fetchFn even when __TAURI__ is present", async () => {
+  const { restore } = installMockTauri(async () => {
+    throw new Error("invoke must not be called when a fetchFn is passed");
+  });
+  try {
+    const { fetchFn, calls } = mockDeviceFetch([
+      {
+        device_code: "dev-123",
+        user_code: "ABCD-EFGH",
+        verification_uri: "https://github.com/device",
+        expires_in: 900,
+        interval: 5,
+      },
+    ]);
+    const got = await requestDeviceCode("Iv1.testclient", fetchFn);
+    assert.equal(got.deviceCode, "dev-123");
+    assert.equal(calls[0]?.url, GITHUB_DEVICE_CODE_URL);
+  } finally {
+    restore();
+  }
+});
+
+test("hunt 5: pollDeviceToken uses github_device_token (invoke) when __TAURI__ is present — fetch never called", async () => {
+  let n = 0;
+  const { calls, restore } = installMockTauri(async (cmd, args) => {
+    assert.equal(cmd, "github_device_token");
+    assert.deepEqual(args, {
+      client_id: "Ov23lic8terv0XOd3GDe",
+      device_code: "dev-123",
+    });
+    n += 1;
+    if (n < 3) return { error: "authorization_pending" };
+    return { access_token: "gho_token123" };
+  });
+  try {
+    const slept: number[] = [];
+    const token = await pollDeviceToken("dev-123", {
+      sleepFn: async (ms) => {
+        slept.push(ms);
+      },
+      deadlineMs: Date.now() + 60_000,
+    });
+    assert.equal(token, "gho_token123");
+    assert.equal(calls.length, 3);
+    assert.deepEqual(slept, [5000, 5000]);
+  } finally {
+    restore();
+  }
+});
+
+test("hunt 5: pollDeviceToken maps the Rust path's expired_token instead of polling forever", async () => {
+  const { restore } = installMockTauri(async () => ({ error: "expired_token" }));
+  try {
+    await assert.rejects(
+      () => pollDeviceToken("dev-123", { sleepFn: async () => {}, deadlineMs: Date.now() + 60_000 }),
+      /expired/,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("hunt 5: a rejected invoke surfaces as a friendly couldn't-reach-GitHub message, never a bare Failed to fetch", async () => {
+  const { restore } = installMockTauri(async () => {
+    throw new Error("Failed to fetch");
+  });
+  try {
+    await assert.rejects(() => requestDeviceCode("Iv1.testclient"), /Couldn't reach GitHub/);
+    await assert.rejects(
+      () => pollDeviceToken("dev-123", { sleepFn: async () => {}, deadlineMs: Date.now() + 60_000 }),
+      /Couldn't reach GitHub/,
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("hunt 5: friendlySignInError translates bare browser network errors and leaves real messages alone", () => {
+  const translated = friendlySignInError("Failed to fetch");
+  assert.match(translated, /Couldn't reach GitHub/);
+  assert.match(translated, /tap “Sign in with GitHub” again/);
+  assert.match(translated, /Failed to fetch/);
+  assert.match(friendlySignInError("TypeError: Load failed"), /Couldn't reach GitHub/);
+  assert.match(friendlySignInError("NetworkError when attempting to fetch resource."), /Couldn't reach GitHub/);
+  const disabled =
+    "GitHub sign-in failed: Device Flow is not enabled on this OAuth App. Enable it in the OAuth App settings (GitHub Settings → Developer settings → OAuth Apps → ArkNetzWebWeaver → Enable Device Flow), then try again.";
+  assert.equal(friendlySignInError(disabled), disabled);
+  assert.equal(
+    friendlySignInError("GitHub sign-in failed: the device code expired — start sign-in again for a fresh code."),
+    "GitHub sign-in failed: the device code expired — start sign-in again for a fresh code.",
+  );
+});
+
+test("hunt 5: fetchGithubUser turns a dropped connection into a friendly message, not a bare Failed to fetch", async () => {
+  const throwingFetch = (async () => {
+    throw new Error("Failed to fetch");
+  }) as unknown as typeof fetch;
+  await assert.rejects(() => fetchGithubUser("gho_token123", throwingFetch), /Couldn't reach GitHub/);
 });

@@ -12,6 +12,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+# Hunt 5: only for the #[ignore]d live GitHub test below (tokio runtime
+# for the async commands). The normal suite never touches the network.
+tokio = { version = "1", features = ["rt", "macros"] }
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-deep-link = "2"

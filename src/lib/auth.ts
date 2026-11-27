@@ -89,6 +89,34 @@ export function isMasterUser(githubLogin: string | null | undefined): boolean {
   return githubLogin === MASTER_GITHUB_USER;
 }
 
+/** The Tauri shell's invoke bridge, when the app runs inside Tauri
+ *  (window.__TAURI__ with withGlobalTauri). Null in a plain browser
+ *  or in tests that do not install a mock. */
+type TauriCore = {
+  core: { invoke(cmd: string, args?: unknown): Promise<unknown> };
+};
+
+function tauriCore(): TauriCore["core"] | null {
+  const tauri = (globalThis as unknown as { __TAURI__?: TauriCore }).__TAURI__;
+  return tauri?.core ?? null;
+}
+
+/** Turn a bare browser/network failure into something a person can
+ *  act on. fetch() throws `TypeError: Failed to fetch` (and friends)
+ *  with no cause attached — shown verbatim that string tells the user
+ *  nothing. Anything that is not a network failure passes through
+ *  unchanged, including the exact GitHub error strings
+ *  (device_flow_disabled, expired_token, …). */
+export function friendlySignInError(message: string): string {
+  if (/failed to fetch|networkerror|network request failed|load failed|failed to load/i.test(message)) {
+    return (
+      "Couldn't reach GitHub — check your connection, then tap “Sign in with GitHub” again. " +
+        `(The network said: ${message})`
+    );
+  }
+  return message;
+}
+
 /** Exchange a code for a token via the Tauri command. In a plain browser
  *  (no Tauri) this throws — sign-in is a Tauri-app feature, not a web-page
  *  feature, precisely so the secret never reaches the webview.
@@ -99,14 +127,14 @@ export async function exchangeCode(
   code: string,
   clientId = GITHUB_OAUTH_CLIENT_ID,
 ): Promise<string> {
-  const tauri = (globalThis as unknown as { __TAURI__?: { core: { invoke(cmd: string, args?: unknown): Promise<unknown> } } }).__TAURI__;
-  if (!tauri) {
+  const core = tauriCore();
+  if (!core) {
     throw new Error(
       "GitHub token exchange needs the Tauri shell (github_oauth_exchange command). " +
         "Running outside Tauri — sign-in stops here, no token is issued.",
     );
   }
-  const result = (await tauri.core.invoke("github_oauth_exchange", { code, client_id: clientId })) as {
+  const result = (await core.invoke("github_oauth_exchange", { code, client_id: clientId })) as {
     accessToken?: string;
     error?: string;
   };
@@ -129,13 +157,20 @@ export async function fetchGithubUser(
   token: string,
   fetchFn: typeof fetch = globalThis.fetch,
 ): Promise<GithubUser> {
-  const res = await fetchFn(`${GITHUB_API_BASE}/user`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "User-Agent": USER_AGENT,
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetchFn(`${GITHUB_API_BASE}/user`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": USER_AGENT,
+      },
+    });
+  } catch (err) {
+    // Hunt 5: a dropped connection while reading /user used to surface
+    // as a bare "Failed to fetch". Say what happened and what to try.
+    throw new Error(friendlySignInError(err instanceof Error ? err.message : String(err)));
+  }
   if (!res.ok) {
     throw new Error(
       `GitHub /user lookup failed: HTTP ${res.status} — the token was not accepted, so no account was created`,
@@ -194,6 +229,22 @@ export async function completeOAuthCallback(
 //      "urn:ietf:params:oauth:grant-type:device_code"}
 //     -> {access_token} | {error: "authorization_pending"|"slow_down"|
 //       "expired_token"|"access_denied"|"device_flow_disabled"}
+// Hunt 5: BOTH posts go through the Tauri Rust commands
+// `github_device_code` / `github_device_token` (src-tauri/src/lib.rs)
+// whenever the app runs inside Tauri. They used to go through
+// window.fetch — and GitHub's login endpoints send NO
+// Access-Control-Allow-Origin header, so the WebView's CORS check
+// rejected the (HTTP 200) response and fetch threw a bare
+// "Failed to fetch" on Stanley's Pixel (v0.5.0). Rust has no CORS,
+// so the same posts succeed there. The window.fetch path below
+// survives ONLY for plain-browser/test use: passing an explicit
+// fetchFn forces it (tests do this), and with no __TAURI__ present
+// the global fetch is the only option left.
+// The GET /user call (fetchGithubUser, above) deliberately stays on
+// fetch: api.github.com DOES return Access-Control-Allow-Origin: *
+// (verified live 2026-11-27), so the WebView fetch is not blocked
+// there, and routing it through Rust would add a third command —
+// and another IPC hop carrying the access token — for no gain.
 // One prerequisite lives OUTSIDE this repo: Device Flow must be
 // enabled on the OAuth App itself (GitHub Settings -> Developer
 // settings -> OAuth Apps -> ArkNetzWebWeaver -> "Enable Device Flow").
@@ -215,27 +266,49 @@ export interface DeviceCodeResponse {
   interval: number;
 }
 
-/** Ask GitHub for a device code. `fetchFn` is injectable so tests
- *  never hit real GitHub; production passes the global fetch. Throws
- *  loudly on device_flow_disabled with the exact fix (enable Device
- *  Flow on the OAuth App). */
+/** Ask GitHub for a device code. Inside Tauri this goes through the
+ *  `github_device_code` Rust command (no CORS in Rust — see above);
+ *  with an explicit `fetchFn` it uses that fetch instead (tests, and
+ *  plain-browser use where there is no Tauri shell). Throws loudly
+ *  on device_flow_disabled with the exact fix (enable Device Flow on
+ *  the OAuth App). A network failure surfaces as a friendly
+ *  couldn't-reach-GitHub message, never a bare "Failed to fetch". */
 export async function requestDeviceCode(
   clientId = GITHUB_OAUTH_CLIENT_ID,
-  fetchFn: typeof fetch = globalThis.fetch,
+  fetchFn?: typeof fetch,
 ): Promise<DeviceCodeResponse> {
-  const res = await fetchFn(GITHUB_DEVICE_CODE_URL, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": USER_AGENT,
-    },
-    body: new URLSearchParams({
-      client_id: clientId,
-      scope: GITHUB_OAUTH_SCOPES.join(" "),
-    }).toString(),
-  });
-  const body = (await res.json()) as Record<string, unknown>;
+  let body: Record<string, unknown>;
+  const core = fetchFn ? null : tauriCore();
+  if (core) {
+    try {
+      body = (await core.invoke("github_device_code", {
+        client_id: clientId,
+        scope: GITHUB_OAUTH_SCOPES.join(" "),
+      })) as Record<string, unknown>;
+    } catch (err) {
+      throw new Error(friendlySignInError(err instanceof Error ? err.message : String(err)));
+    }
+  } else {
+    const fetchImpl = fetchFn ?? globalThis.fetch;
+    let res: Response;
+    try {
+      res = await fetchImpl(GITHUB_DEVICE_CODE_URL, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": USER_AGENT,
+        },
+        body: new URLSearchParams({
+          client_id: clientId,
+          scope: GITHUB_OAUTH_SCOPES.join(" "),
+        }).toString(),
+      });
+    } catch (err) {
+      throw new Error(friendlySignInError(err instanceof Error ? err.message : String(err)));
+    }
+    body = (await res.json()) as Record<string, unknown>;
+  }
   if (typeof body.error === "string") {
     if (body.error === "device_flow_disabled") {
       throw new Error(
@@ -264,7 +337,14 @@ export async function requestDeviceCode(
  *  expires). Sleeps `interval` seconds between attempts; honors
  *  slow_down by adding 5 s; stops at `deadlineMs` (the code's
  *  expiry). `sleepFn` is injectable so tests run instantly. Returns
- *  the access token; never invents one. */
+ *  the access token; never invents one.
+ *  Inside Tauri each poll attempt goes through the
+ *  `github_device_token` Rust command (no CORS in Rust — see above);
+ *  an explicit `fetchFn` forces the fetch path instead (tests, and
+ *  plain-browser use). A network failure on one attempt ends the
+ *  sign-in with a friendly couldn't-reach-GitHub message — it does
+ *  NOT silently retry, so a dead connection never spins the poll
+ *  until the code expires. */
 export async function pollDeviceToken(
   deviceCode: string,
   opts: {
@@ -276,25 +356,46 @@ export async function pollDeviceToken(
   } = {},
 ): Promise<string> {
   const clientId = opts.clientId ?? GITHUB_OAUTH_CLIENT_ID;
-  const fetchFn = opts.fetchFn ?? globalThis.fetch;
   const sleepFn = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   let intervalMs = (opts.intervalSec ?? 5) * 1000;
   const deadlineMs = opts.deadlineMs ?? Date.now() + 900_000;
+  const core = opts.fetchFn ? null : tauriCore();
+  /** One poll attempt, by whichever transport applies. Returns the
+   *  raw GitHub JSON shape ({access_token} or {error}) either way,
+   *  so the loop below maps errors exactly as before. */
+  const postOnce = async (): Promise<Record<string, unknown>> => {
+    if (core) {
+      try {
+        return (await core.invoke("github_device_token", {
+          client_id: clientId,
+          device_code: deviceCode,
+        })) as Record<string, unknown>;
+      } catch (err) {
+        throw new Error(friendlySignInError(err instanceof Error ? err.message : String(err)));
+      }
+    }
+    const fetchImpl = opts.fetchFn ?? globalThis.fetch;
+    try {
+      const res = await fetchImpl(GITHUB_TOKEN_URL, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": USER_AGENT,
+        },
+        body: new URLSearchParams({
+          client_id: clientId,
+          device_code: deviceCode,
+          grant_type: DEVICE_FLOW_GRANT_TYPE,
+        }).toString(),
+      });
+      return (await res.json()) as Record<string, unknown>;
+    } catch (err) {
+      throw new Error(friendlySignInError(err instanceof Error ? err.message : String(err)));
+    }
+  };
   for (;;) {
-    const res = await fetchFn(GITHUB_TOKEN_URL, {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": USER_AGENT,
-      },
-      body: new URLSearchParams({
-        client_id: clientId,
-        device_code: deviceCode,
-        grant_type: DEVICE_FLOW_GRANT_TYPE,
-      }).toString(),
-    });
-    const body = (await res.json()) as Record<string, unknown>;
+    const body = await postOnce();
     if (typeof body.access_token === "string" && body.access_token) {
       return body.access_token;
     }
