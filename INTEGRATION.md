@@ -3134,7 +3134,8 @@ Cancel, Cancel works) verified on the final dist.
   three commits (Task 1 sign-in fix; Task 2 dropdown topbar; Task 3
   sweep + P1/P2/wiring + this record). No release, no version bump,
   keystore untouched, dist/ not tracked (confirmed 404 on raw).
-  Live head after push: <HEAD-SHA — fill in after the push lands>.
+  Live head after push: `5a06aa12` (commit 3 of 3; commit 1 `79786e92`,
+  commit 2 `aec6dfee`).
 
 ### Still needs Stanley's phone
 
