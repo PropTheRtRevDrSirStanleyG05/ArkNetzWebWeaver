@@ -207,21 +207,22 @@ test("shell: panels are a full-width strip above the reader, status below the to
 // everywhere now (minor bump for the feature-round-2 additions since
 // 0.3.0: collab, tables/lists, HTML importer). Hunt 4: patch bump to
 // 0.4.1 for the OAuth device-flow + mobile + sub-page + export fixes.
-// 0.5.0 (minor bump): optional P2P transport, real-time media calling,
-// zstd dictionary drop.
-test("hunt3: topbar is sticky and the app reports one version, 0.5.0", () => {
+// 0.5.1 (patch bump): bug hunt 5 — device-flow sign-in via Rust
+// commands (CORS fix), dropdown topbar, 7 sweep defects, Wayback
+// Rust fetch.
+test("hunt3: topbar is sticky and the app reports one version, 0.5.1", () => {
   const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
   const css = readFileSync(new URL("../styles.css", import.meta.url), "utf8");
   assert.match(css, /\.an-topbar\{[^}]*position:sticky;top:0/);
-  assert.match(html, /ArkNetzWebWeaver 0\.5\.0/);
+  assert.match(html, /ArkNetzWebWeaver 0\.5\.1/);
   assert.doesNotMatch(html, /core shell 0\.1\.0 \+ visual builder/);
   assert.doesNotMatch(html, /until the central repos exist/);
   const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string };
-  assert.equal(pkg.version, "0.5.0");
+  assert.equal(pkg.version, "0.5.1");
   const tauriConf = JSON.parse(readFileSync(new URL("../../src-tauri/tauri.conf.json", import.meta.url), "utf8")) as { version: string };
-  assert.equal(tauriConf.version, "0.5.0");
+  assert.equal(tauriConf.version, "0.5.1");
   const cargo = readFileSync(new URL("../../src-tauri/Cargo.toml", import.meta.url), "utf8");
-  assert.match(cargo, /^version = "0\.5\.0"$/m);
+  assert.match(cargo, /^version = "0\.5\.1"$/m);
 });
 
 // Fix pass 2 (visual defects, hunt 2): the CSS pins for H1/L7/L8/L9/L10.

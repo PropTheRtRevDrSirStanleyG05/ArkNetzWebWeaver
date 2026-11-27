@@ -1,6 +1,6 @@
 [package]
 name = "arknetzwebweaver"
-version = "0.5.0"
+version = "0.5.1"
 description = "ArkNetzWebWeaver by STANBEYOND — zero-server, $0/month decentralized web (core shell)"
 authors = ["Stanley Garland"]
 edition = "2021"
