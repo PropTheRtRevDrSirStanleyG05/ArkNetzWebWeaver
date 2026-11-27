@@ -14,7 +14,7 @@
 //
 // Licence: MIT. No new dependencies.
 
-import type { NetworkFetch } from "./backends.js";
+import type { NetworkFetch, NetworkRequestInit, NetworkResponse } from "./backends.js";
 
 export const WAYBACK_BASE = "https://web.archive.org";
 export const WAYBACK_SAVE_BASE = "https://web.archive.org/save";
@@ -167,6 +167,59 @@ export function latestSnapshot(snapshots: WaybackSnapshot[]): WaybackSnapshot | 
 export function snapshotDisplayDate(snapshot: WaybackSnapshot): string {
   const t = snapshot.timestamp;
   return `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)} ${t.slice(8, 10)}:${t.slice(10, 12)} UTC`;
+}
+
+/** The Tauri shell's invoke bridge, when the app runs inside Tauri
+ *  (window.__TAURI__ with withGlobalTauri). Null in a plain browser
+ *  or in tests that do not install a mock. Mirrors auth.ts. */
+type TauriCore = {
+  core: { invoke(cmd: string, args?: unknown): Promise<unknown> };
+};
+
+function tauriCore(): TauriCore["core"] | null {
+  const tauri = (globalThis as unknown as { __TAURI__?: TauriCore }).__TAURI__;
+  return tauri?.core ?? null;
+}
+
+/** Result shape of the Rust `wayback_fetch` command (lib.rs). */
+interface WaybackFetchResult {
+  status: number;
+  body?: string | null;
+  error?: string | null;
+}
+
+/**
+ * Fetch for web.archive.org URLs that works inside the Tauri WebView.
+ * Hunt 5 (P1): web.archive.org/cdx sends no Access-Control-Allow-Origin
+ * header, so a plain window.fetch from the app origin is CORS-blocked
+ * in the WebView even though the device is online — every Time Machine
+ * lookup failed with a bare "Failed to fetch". In Tauri the GET goes
+ * through the Rust `wayback_fetch` command (reqwest, no CORS; the host
+ * is restricted to web.archive.org server-side). Outside Tauri this is
+ * the plain global fetch, so tests and plain browsers are unchanged.
+ * The returned object is only the NetworkResponse shape listSnapshots
+ * and fetchLatestSnapshot use (status + text()); headers are empty,
+ * and the User-Agent header listSnapshots asks for is dropped on the
+ * Rust path — the CDX API does not need it.
+ */
+export async function waybackFetch(
+  url: string,
+  init?: NetworkRequestInit,
+): Promise<NetworkResponse> {
+  const core = tauriCore();
+  if (!core) {
+    return globalThis.fetch(url, init);
+  }
+  const result = (await core.invoke("wayback_fetch", { url })) as WaybackFetchResult;
+  if (typeof result.error === "string" && result.error) {
+    throw new Error(result.error);
+  }
+  const body = typeof result.body === "string" ? result.body : "";
+  return {
+    status: result.status,
+    headers: { get: (_name: string) => null },
+    text: async () => body,
+  };
 }
 
 /** Query the CDX API and list every historical snapshot for a URL. */

@@ -41,6 +41,8 @@ import {
   checkFaststart,
   checkPosterBudget,
   continueWatchingList,
+  createIndexedDBMyListStore,
+  createIndexedDBProgressStore,
   createMemoryMyListStore,
   createMemoryProgressStore,
   episodesForSeason,
@@ -362,6 +364,19 @@ test("streaming: Continue Watching save/resume/mark-watched, episode-3 at 14:22"
   assert.equal(parseTimestamp("14:22"), 862);
   assert.equal(parseTimestamp("1:01:01"), 3661);
   assert.equal(parseTimestamp("nope"), null);
+  // Hunt 5: the old parser accepted junk — "14:99" (99 seconds),
+  // "1.5:30" (fractional minutes), "14:" (empty seconds), "1:60:00"
+  // (60 minutes in h:mm:ss) and "-1:30" all parsed as real times.
+  assert.equal(parseTimestamp("14:99"), null);
+  assert.equal(parseTimestamp("1.5:30"), null);
+  assert.equal(parseTimestamp("14:"), null);
+  assert.equal(parseTimestamp(":22"), null);
+  assert.equal(parseTimestamp("1:60:00"), null);
+  assert.equal(parseTimestamp("1:02:60"), null);
+  assert.equal(parseTimestamp("-1:30"), null);
+  assert.equal(parseTimestamp("1:2:3:4"), null);
+  // Minutes in mm:ss stay unbounded — a 90-minute position is real.
+  assert.equal(parseTimestamp("90:00"), 5400);
 
   const catalog = sampleCatalog();
   const list = await continueWatchingList(store, catalog);
@@ -393,6 +408,16 @@ test("streaming: My List is local-only — add/remove, never synced, no network"
   assert.equal(found?.series.id, "s1");
   assert.equal(found?.season.number, 2);
   assert.equal(findEpisode(catalog, "missing"), null);
+});
+
+test("streaming: IndexedDB progress + My List stores throw cleanly where IndexedDB does not exist (Node)", () => {
+  // Hunt 5: the app used to wire the MEMORY stores even in the
+  // browser, so Continue Watching and My List vanished on every
+  // reload. The IndexedDB stores exist now (app.ts picks them when
+  // useIndexedDB is on); their real read/write path needs a browser
+  // — here they must fail loudly, never silently fall back to memory.
+  assert.throws(() => createIndexedDBProgressStore(), /IndexedDB is not available/);
+  assert.throws(() => createIndexedDBMyListStore(), /IndexedDB is not available/);
 });
 
 test("streaming: Range headers, resume logic, seek estimate, faststart check", () => {

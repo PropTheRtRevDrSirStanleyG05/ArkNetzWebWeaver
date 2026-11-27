@@ -15,6 +15,19 @@
     <div id="account-menu" class="an-account-menu" hidden></div>
     <button id="signin-btn" type="button">Sign in with GitHub</button>
   </div>
+  <!-- Hunt 5: the top-of-screen menu (Stanley: "most of the stuff at
+    the top can live in a drop down menu"). On narrow screens the
+    panel nav + toolbar secondary actions move into #topmenu (see
+    src/lib/topmenu.ts); on desktop the button is display:none and
+    nothing moves. The menu is empty in this file — its slots are
+    filled at runtime by re-parenting the live nodes. -->
+  <button id="topmenu-btn" class="an-topmenu-btn" type="button" aria-label="Menu" aria-expanded="false" aria-controls="topmenu" title="Menu">☰</button>
+  <nav id="topmenu" class="an-topmenu" hidden aria-label="Menu">
+    <h2>Panels</h2>
+    <div data-topmenu-slot="panels"></div>
+    <h2>Tools</h2>
+    <div class="an-menu-tools" data-topmenu-slot="tools"></div>
+  </nav>
 </header>
 <!-- Sign-in status lives here, in its own full-width strip below the
   topbar — never inside the topbar, where a long OAuth error used to

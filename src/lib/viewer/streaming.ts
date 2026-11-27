@@ -157,12 +157,26 @@ export function formatTimestamp(totalSeconds: number): string {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
-/** "14:22" -> seconds. Returns null on malformed input. */
+/** "14:22" -> seconds. Returns null on malformed input: every part
+ *  must be a non-empty run of digits (no fractions, no signs, no
+ *  blanks — "14:", "1.5:30" and "-1:30" are all malformed), and
+ *  seconds (and minutes in the h:mm:ss form) must be under 60, so
+ *  "14:99" and "1:60:00" are rejected instead of silently meaning
+ *  something else. Minutes in the mm:ss form are unbounded — a
+ *  90-minute position is "90:00". */
 export function parseTimestamp(text: string): number | null {
-  const parts = text.trim().split(":").map((p) => Number(p));
-  if (parts.length < 2 || parts.length > 3 || parts.some((p) => !Number.isFinite(p) || p < 0)) return null;
-  if (parts.length === 2) return (parts[0]! * 60) + parts[1]!;
-  return (parts[0]! * 3600) + (parts[1]! * 60) + parts[2]!;
+  const parts = text.trim().split(":");
+  if (parts.length < 2 || parts.length > 3) return null;
+  if (parts.some((p) => !/^\d+$/.test(p))) return null;
+  const nums = parts.map((p) => Number(p));
+  const seconds = nums[nums.length - 1] as number;
+  if (seconds >= 60) return null;
+  if (nums.length === 3) {
+    const minutes = nums[1] as number;
+    if (minutes >= 60) return null;
+    return (nums[0] as number) * 3600 + minutes * 60 + seconds;
+  }
+  return (nums[0] as number) * 60 + seconds;
 }
 
 // --- Continue Watching (local IndexedDB-shaped store, never synced) --------
@@ -323,6 +337,111 @@ export async function listMyList(store: MyListStore, catalog: Series[]): Promise
   const entries = (await store.getAll()).sort((a, b) => b.addedAt - a.addedAt);
   const byId = new Map(catalog.map((s) => [s.id, s]));
   return entries.map((e) => byId.get(e.seriesId)).filter((s): s is Series => s !== undefined);
+}
+
+// --- IndexedDB stores (hunt 5) -------------------------------------------
+// The app used to wire the MEMORY stores even in the browser, so
+// Continue Watching and My List vanished on every reload — while the
+// Watch panel promised positions are "stored locally in IndexedDB".
+// These are the real IndexedDB stores (same open/transaction shape
+// as the mail draft store); app.ts picks them when useIndexedDB is
+// on. Same privacy rule as the memory stores: local only, never
+// synced, never uploaded.
+
+const IDB_DB = "arknetz-streaming";
+const IDB_PROGRESS_STORE = "progress";
+const IDB_MYLIST_STORE = "mylist";
+
+function openStreamingDb(): Promise<IDBDatabase> {
+  if (typeof indexedDB === "undefined") {
+    throw new Error("IndexedDB is not available in this environment");
+  }
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_DB, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(IDB_PROGRESS_STORE, { keyPath: "episodeId" });
+      req.result.createObjectStore(IDB_MYLIST_STORE, { keyPath: "seriesId" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+const idbReq = <T>(r: IDBRequest<T>): Promise<T> =>
+  new Promise((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+
+async function idbWithStore<T>(
+  storeName: string,
+  mode: IDBTransactionMode,
+  fn: (s: IDBObjectStore) => Promise<T>,
+): Promise<T> {
+  const db = await openStreamingDb();
+  try {
+    return await fn(db.transaction(storeName, mode).objectStore(storeName));
+  } finally {
+    db.close();
+  }
+}
+
+/** Continue Watching positions in IndexedDB — survives reloads. */
+export function createIndexedDBProgressStore(): ProgressStore {
+  if (typeof indexedDB === "undefined") {
+    throw new Error("IndexedDB is not available in this environment");
+  }
+  return {
+    async get(episodeId) {
+      return idbWithStore(IDB_PROGRESS_STORE, "readonly", (s) =>
+        idbReq(s.get(episodeId) as IDBRequest<WatchProgress | undefined>),
+      );
+    },
+    async put(p) {
+      await idbWithStore(IDB_PROGRESS_STORE, "readwrite", async (s) => {
+        await idbReq(s.put(p) as unknown as IDBRequest<IDBValidKey>);
+      });
+    },
+    async delete(episodeId) {
+      await idbWithStore(IDB_PROGRESS_STORE, "readwrite", async (s) => {
+        await idbReq(s.delete(episodeId) as unknown as IDBRequest<undefined>);
+      });
+    },
+    async getAll() {
+      return idbWithStore(IDB_PROGRESS_STORE, "readonly", (s) =>
+        idbReq(s.getAll() as IDBRequest<WatchProgress[]>),
+      );
+    },
+  };
+}
+
+/** My List in IndexedDB — survives reloads, still local-only. */
+export function createIndexedDBMyListStore(): MyListStore {
+  if (typeof indexedDB === "undefined") {
+    throw new Error("IndexedDB is not available in this environment");
+  }
+  return {
+    async get(seriesId) {
+      return idbWithStore(IDB_MYLIST_STORE, "readonly", (s) =>
+        idbReq(s.get(seriesId) as IDBRequest<MyListEntry | undefined>),
+      );
+    },
+    async put(e) {
+      await idbWithStore(IDB_MYLIST_STORE, "readwrite", async (s) => {
+        await idbReq(s.put(e) as unknown as IDBRequest<IDBValidKey>);
+      });
+    },
+    async delete(seriesId) {
+      await idbWithStore(IDB_MYLIST_STORE, "readwrite", async (s) => {
+        await idbReq(s.delete(seriesId) as unknown as IDBRequest<undefined>);
+      });
+    },
+    async getAll() {
+      return idbWithStore(IDB_MYLIST_STORE, "readonly", (s) =>
+        idbReq(s.getAll() as IDBRequest<MyListEntry[]>),
+      );
+    },
+  };
 }
 
 // --- Click-to-play + HTTP Range seeking ------------------------------------

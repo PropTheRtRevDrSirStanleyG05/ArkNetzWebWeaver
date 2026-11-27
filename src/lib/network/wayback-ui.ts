@@ -27,9 +27,16 @@ export const WAYBACK_URL_INPUT_ID = "an-wayback-url";
 export const WAYBACK_RESULTS_ID = "an-wayback-results";
 export const WAYBACK_RETRY_BUTTON_ID = "an-wayback-retry-btn";
 
-/** Canonical plain-language message for an unreachable archive.org. */
+/** Canonical plain-language message for an unreachable archive.org.
+ *  Hunt 5: the second sentence matters — before P1, web.archive.org's
+ *  CDX API sent no Access-Control-Allow-Origin header, so the app's
+ *  in-WebView fetch was blocked even when the device was online, and
+ *  saying only "check your connection" sent the user chasing their
+ *  wifi for an app-side block. P1 moved the lookup to the Rust
+ *  `wayback_fetch` command (no CORS), so a failure now genuinely
+ *  means the network or archive.org itself, and the message says so. */
 export const WAYBACK_UNREACHABLE_MESSAGE =
-  "Could not reach archive.org — check your connection and try again.";
+  "Could not reach archive.org — check your connection and try again. If you are online, archive.org itself may be down or blocking the request.";
 
 export type WaybackLookupState =
   | { status: "idle" }

@@ -35,7 +35,7 @@ import type { ProtocolManifest } from "./types.js";
 import { CachedFetcher } from "./cache.js";
 import { createMemoryPingStore, createIndexedDBTelemetrySettingsStore, createMemoryTelemetrySettingsStore, defaultTelemetrySettings, emptyStats } from "./viewer/stats.js";
 import type { SiteStats, TelemetrySettings, TelemetrySettingsStore } from "./viewer/stats.js";
-import { createMemoryMyListStore, createMemoryProgressStore } from "./viewer/streaming.js";
+import { createIndexedDBMyListStore, createIndexedDBProgressStore, createMemoryMyListStore, createMemoryProgressStore } from "./viewer/streaming.js";
 import type { DraftStore } from "./mail/compose.js";
 import { P2PHost } from "./p2p/host.js";
 import { createIndexedDBP2PStore, createMemoryP2PStore } from "./p2p/store.js";
@@ -251,8 +251,12 @@ export function createArkNetzApp(options: ArkNetzAppOptions = {}): ArkNetzApp {
   // note): the panel render/wire path cannot await a store read, so
   // reads serve the mirror and writes update it first, then persist.
   let currentTelemetrySettings: TelemetrySettings = defaultTelemetrySettings();
-  const progressStore = createMemoryProgressStore();
-  const myListStore = createMemoryMyListStore();
+  // Hunt 5: these used to be memory stores unconditionally, so
+  // Continue Watching and My List vanished on every reload while the
+  // Watch panel promised IndexedDB storage. IndexedDB when the app
+  // runs with it, memory otherwise (tests / Node).
+  const progressStore = useIdb ? createIndexedDBProgressStore() : createMemoryProgressStore();
+  const myListStore = useIdb ? createIndexedDBMyListStore() : createMemoryMyListStore();
   const keyring = new AccountKeyring(keyringStore, options.masterGithubUser);
 
   // P2P host (phase 2): per-device settings in IndexedDB when the

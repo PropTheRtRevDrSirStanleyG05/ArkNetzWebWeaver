@@ -2948,3 +2948,199 @@ controller, all with tests)**
   a bad binary); APK never installed on a real device; no live
   OAuth/mail/IA verification; no GitHub Action run anywhere yet;
   real WebRTC untested (loopback/fake-peer doubles only).
+
+## Bug hunt 5 — "Failed to Fetch" + dropdown topbar + full sweep, 2026-11-27
+
+Trigger: Stanley on his Pixel 7 Pro with v0.5.0 — (1) "Sign in with
+GitHub" says "Failed to Fetch", (2) the GUI is "still a bit busy and
+shitty looking, at least on mobile", (3) keep hunting. Then his
+direction: "most of the stuff at the top can live in a drop down
+menu", and the widened scope: "improve everything while you are at
+it, everything you can at least" (fix-plus-improve, no new features,
+no rebrand/colour change, battery 0-fail). Three subagents (diagnosis,
+mobile, sweep) + coordinator wiring/proposals. Full working notes:
+`qa-screenshots/hunt5/HUNT5-NOTES.md` (local only — qa-screenshots
+is not pushed to GitHub).
+
+### TASK 1 — "Failed to Fetch" sign-in (diagnosis + fix)
+
+Root cause: CORS, not the network, not the OAuth App. GitHub's login
+endpoints send no `Access-Control-Allow-Origin` header, so the
+Android WebView rejects the response even though GitHub answers
+HTTP 200 — and `fetch()` throws a bare "Failed to fetch", which
+`startGitHubSignIn()` displayed verbatim. Proven live twice
+(coordinator + agent, `Origin: https://tauri.localhost`): POST
+`https://github.com/login/device/code` → HTTP 200 with a real code
+set, no ACAO header; OPTIONS preflight → 404, also no CORS headers.
+`GET https://api.github.com/user` sends `ACAO: *`, so only the
+`github.com/login/*` POSTs are affected. Hunt 4 never caught it: the
+flow was proven in Node (no CORS) and in headless Chrome with a
+stubbed fetch. Ruled out: wrong origin (URL correct in auth.ts),
+INTERNET permission (present in AndroidManifest), CSP (none
+configured), Device Flow (enabled on the OAuth App), redirect
+fallback firing instead (the button calls the device-flow primary;
+the shipped dist contains the device-flow code).
+
+Fix: both login POSTs moved to Tauri Rust commands (reqwest, no CORS),
+following the existing `github_oauth_exchange` pattern —
+`github_device_code` + `github_device_token` in `src-tauri/src/lib.rs`
+(shared `post_github_form` helper, one rustls client), registered in
+`generate_handler!`; `src/lib/auth.ts` `requestDeviceCode()` /
+`pollDeviceToken()` use `__TAURI__.core.invoke` in Tauri, keeping the
+window.fetch path only for plain-browser/test use (explicit `fetchFn`
+forces it). Poll timing, `slow_down`/deadline logic, and all exact
+GitHub error strings unchanged. `GET /user` deliberately stays on
+fetch (`api.github.com` sends `ACAO:*`).
+
+Improvements (widened scope): new `friendlySignInError()` — bare
+network failures become "Couldn't reach GitHub — check your
+connection, then tap 'Sign in with GitHub' again. (The network said:
+…)", all real messages pass through unchanged; applied at every
+sign-in failure surface. Friendlier device-code strip copy.
+
+Verification: `tsc` clean; 8 new tests in `tests/auth.test.ts`
+(invoke path with mocked `__TAURI__`, fetch fails loudly if touched);
+`cargo check --offline` exit 0; live Rust test
+(`github_device_commands_live_round_trip`, ignored) passes — real
+device code from GitHub, bogus code returns an error, never a token.
+Env repair (VM reset): libzstd1 downgraded to stock first, Tauri
+-dev packages reinstalled; the test-only client builder loads
+`SSL_CERT_FILE` under `#[cfg(test)]` (production trust roots
+unchanged) because this VM's egress-proxy CA isn't trusted by rustls.
+
+Phone check (only Stanley): tap Sign in — within seconds a code
+strip ("Enter code XXXX-XXXX at github.com/device — it just opened
+in your browser…") with the browser opening github.com/device by
+itself, then auto-completion to "Signed in with GitHub as
+PropTheRtRevDrSirStanleyG05".
+
+### TASK 2 — Mobile GUI declutter + dropdown topbar (Stanley's direction)
+
+On ≤700px the 16-button panel nav and the toolbar's secondary actions
+(Back, Forward, + Tab, Bookmark, Edit site) collapse into a ☰ menu
+hanging off the sticky topbar (`src/lib/topmenu.ts`, new — menu
+behaviour + narrow-screen node relocation; desktop restores exact
+order). Visible at all times: brand, Guest pill + Sign in, the 44×44
+menu button, the tab row, and the address bar + Go. Desktop
+untouched (verified at 1280px). Menu is max 70% of viewport height
+with its own scroll; closes on selection, outside tap, and Escape
+(focus returns to the trigger). After a menu selection,
+`scrollBelowTopbar` still lands the panel heading below the bar
+(Calls heading top 186–189px vs bar bottom 57–60px, all widths).
+Wiring: `initTopMenu()` from `src/main.ts` (coordinator applied the
+agent's proposal; the temporary inline script in `src/index.html`
+was removed so main.ts is the single owner).
+
+Measured at 360/390/412: top chrome ~570–590px (68–70% of viewport)
+→ ~170px fixed; buttons above the fold 25 → 5; sub-44px tap targets
+13 → 0 at load and with the menu open, all widths; text inputs
+(address, IA ×4, P2P TURN, keyring, editor sidebar, import URL) all
+44px; editor bar compacted (Role + Theme share a row, tighter gaps);
+`touch-action:manipulation` on buttons. Two recheck regressions
+caught and fixed: Guest pill collapsing to "G…" (fixed with
+`flex-shrink:0` on the pill; brand truncates first at 360px) and the
+topbar wrapping to two rows at 412px (compact one-row treatment
+extended to the whole ≤700px range).
+
+Judgement calls (for Stanley): address bar + Go stay visible (hiding
+them would make every navigation need the menu); brand truncates at
+360px rather than shortening "Sign in with GitHub"; Tools sit below
+the 16 panels in the menu (scroll to reach); editor bar compacted,
+not collapsed — Publish is the primary action and hiding it behind a
+tap has a real downside (coordinator decision; screenshot
+`mobile/360-builder-top-after.png`). P2P "doubled heading" is not a
+defect (`<h2>P2P</h2>` + `<h3>Peer-to-peer (optional)</h3>` — proper
+hierarchy, left alone).
+
+Tests: `tests/topmenu.test.ts` (new, 9 tests). Screenshots:
+`qa-screenshots/hunt5/mobile/` (31 after-shots) +
+`MOBILE-AUDIT-5.md`.
+
+### TASK 3 — Full bug-hunt sweep (7 defects fixed)
+
+1. **ToS acceptance never stuck (HIGH)** — `src/lib/panels.ts`:
+   render and the Accept handler each created a fresh memory store,
+   so acceptance vanished on panel switch. Fixed with one shared
+   `PanelState.tosStore`; the section now flips to "Accepted <date>".
+2. **Continue Watching / My List lost on every reload (HIGH)** —
+   `src/lib/viewer/streaming.ts` had no IndexedDB stores and
+   `src/lib/app.ts` wired memory unconditionally, while the Watch
+   panel promises IndexedDB. Added
+   `createIndexedDBProgressStore()` + `createIndexedDBMyListStore()`
+   and wired them under `useIndexedDB`. Browser-verified: episode-3
+   at 14:22 + My List entry survive a full reload.
+3. **Accounts sign-in copy described the redirect flow** — rewrote to
+   device-flow primary + redirect fallback (`panels.ts:363`).
+4. **`parseTimestamp` accepted junk** ("14:99", "1.5:30", "14:") —
+   now strict; "90:00" stays valid.
+5. **Mail Send promised a local save it never did** — send handler
+   now saves the draft first; also fixed empty-To (`[""]`) wrongly
+   rejecting CC-only drafts.
+6. **Wayback error blamed the connection only** — message now names
+   the in-app block (see 7).
+7. **Time Machine CDX lookup can never succeed in the shipped app
+   (found, fixed by the coordinator as P1 below)** —
+   `web.archive.org/cdx` sends no `Access-Control-Allow-Origin`
+   (verified live with/without `Origin:`), and the panel fetched via
+   plain `window.fetch`.
+
+Improvements: mail compose now has CC/BCC fields (parity §3);
+Comments panel names the site being read instead of the hardcoded
+demo thread; Settings copy fixed ("sidebar on the left" → "below
+the reader on a phone").
+
+Flows checked clean: domain-claim refusal, collab-join refusal,
+mail keypair/draft/send-refusal, Drive chunk boundaries + no-token
+refusal, offline bundle save (3.2 KB summary), Wayback results vs
+stub, account-pill menu, streaming, comments, stats toggles
+persisting. Regressions all hold: h2 below topbar at 360/390/412/
+desktop, fresh scrollY 0, no overflow, no console errors; About nav
+4/4 widths; export rewriting + device-flow strip (code + Open +
+Cancel, Cancel works) verified on the final dist.
+
+### Coordinator — P1 + P2 + wiring + verification
+
+- **P1 (Wayback Rust command):** `wayback_fetch` in lib.rs (GET via
+  the shared rustls client, URL restricted to
+  `https://web.archive.org`, returns `{status, body, error}`) +
+  `waybackFetch` adapter in `src/lib/network/wayback.ts` (invoke in
+  Tauri, plain fetch outside) + `src/lib/panels.ts:725` wires it into
+  the Time Machine panel. Unreachable message updated (no longer
+  "needs an app update to fix"). 5 new tests in
+  `tests/wayback.test.ts`; ignored live Rust test passes (CDX query
+  for example.com → 200 + JSON array; non-archive URL refused).
+- **P2 (`useIndexedDB: true`):** `src/main.ts:899`
+  `createArkNetzApp({ useIndexedDB: true })` — without it the
+  streaming fix was dead code on the phone. All IDB stores already
+  existed; `init()` already awaits the loads. Coordinator-verified
+  in headless Chrome at 360px: `arknetz-ia`, `arknetz-keyring`,
+  `arknetz-p2p`, `arknetz-telemetry` exist after load;
+  `arknetz-streaming` appears once the Watch panel mounts.
+- **Topmenu wiring** applied (see Task 2); coordinator probe
+  (`/tmp/hunt5-coord/probe2.mjs`, screenshots `hunt5/coord/`): menu
+  flow, IDB databases, Wayback panel shows the new error copy.
+- Open, not built: offline bundles still pack 0 media (new
+  capability, P3).
+
+### Battery + push
+
+- **830 pass, 0 fail** (`npm test`: `tsc` + `node --test
+  dist/tests/*.test.js`; 804 at v0.5.0 → +26: 8 auth + 9 topmenu +
+  4 sweep + 5 wayback). `cargo check --offline` exit 0 (one
+  pre-existing warning: `let mut builder`, lib.rs:152);
+  `cargo test --offline --lib` 2 passed / 0 failed / 2 ignored; both
+  ignored live tests pass against the real hosts.
+- Pushed to `PropTheRtRevDrSirStanleyG05/ArkNetzWebWeaver` main in
+  three commits (Task 1 sign-in fix; Task 2 dropdown topbar; Task 3
+  sweep + P1/P2/wiring + this record). No release, no version bump,
+  keystore untouched, dist/ not tracked (confirmed 404 on raw).
+  Live head after push: <HEAD-SHA — fill in after the push lands>.
+
+### Still needs Stanley's phone
+
+Tap Sign in (code strip + auto-completion, see Task 1); the dropdown
+menu on the Pixel; Continue Watching / My List surviving a real
+reload; a Time Machine lookup against real archive.org; a live
+domain claim; any live GitHub/IA round-trip; a two-device call; APK
+install of a build containing these fixes (none built here — no
+`tauri build` was run).

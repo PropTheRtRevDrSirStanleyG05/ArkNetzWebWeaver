@@ -18,7 +18,7 @@ import {
   installAppBridgeListener,
 } from "./lib/viewer/app-bridge.js";
 import type { AppBridgeReplyTarget, AppSaveStore } from "./lib/viewer/app-bridge.js";
-import { buildAuthorizeUrl, completeOAuthCallback, completeDeviceSignIn, pollDeviceToken, randomState, requestDeviceCode, savePendingOAuthState, takePendingOAuthState } from "./lib/auth.js";
+import { buildAuthorizeUrl, completeOAuthCallback, completeDeviceSignIn, friendlySignInError, pollDeviceToken, randomState, requestDeviceCode, savePendingOAuthState, takePendingOAuthState } from "./lib/auth.js";
 import { openExternalUrl } from "./lib/opener.js";
 import { addGithubAccount } from "./lib/network/accounts.js";
 import { attachMedia, IaUploadQueue } from "./lib/ia-media.js";
@@ -58,6 +58,7 @@ import type { VaultManager } from "./lib/drive/drive.js";
 import { installDeepLinkListener, isOAuthCallbackUrl } from "./lib/deep-link.js";
 import { scrollBelowTopbar } from "./lib/scroll.js";
 import { mountPanels } from "./lib/panels.js";
+import { initTopMenu } from "./lib/topmenu.js";
 import { AccountPill } from "./lib/network/account-pill.js";
 import type { PillElement } from "./lib/network/account-pill.js";
 import type { AccountProfile, AccountProvider } from "./lib/network/accounts.js";
@@ -571,7 +572,7 @@ function startRedirectSignIn(): void {
       }
     });
   } catch (err) {
-    showStatus(err instanceof Error ? err.message : String(err));
+    showStatus(friendlySignInError(err instanceof Error ? err.message : String(err)));
   }
 }
 
@@ -603,7 +604,10 @@ async function startGitHubSignIn(): Promise<void> {
   try {
     code = await requestDeviceCode();
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    // Hunt 5: a bare "Failed to fetch" used to land here verbatim.
+    // friendlySignInError turns a network failure into what happened
+    // + what to try; every other message passes through unchanged.
+    const message = friendlySignInError(err instanceof Error ? err.message : String(err));
     showStatus(message);
     if (/Device Flow is not enabled/.test(message)) {
       const fallback = document.createElement("button");
@@ -620,11 +624,13 @@ async function startGitHubSignIn(): Promise<void> {
   deviceFlowCancelled = false;
   status.replaceChildren();
   const intro = document.createElement("span");
-  intro.textContent = `GitHub sign-in: enter code `;
+  intro.textContent = `Enter code `;
   const codeEl = document.createElement("code");
   codeEl.textContent = code.userCode;
   const at = document.createElement("span");
-  at.textContent = ` at github.com/device, then wait here — this page completes itself. `;
+  // Hunt 5: say where the code goes and what happens next, instead of
+  // "then wait here — this page completes itself".
+  at.textContent = ` at github.com/device — it just opened in your browser. Approve it there and this page finishes signing you in by itself. `;
   const openBtn = document.createElement("button");
   openBtn.type = "button";
   openBtn.textContent = "Open github.com/device";
@@ -676,7 +682,8 @@ async function startGitHubSignIn(): Promise<void> {
       showStatus("GitHub sign-in cancelled — no account was created.");
       return;
     }
-    showStatus(err instanceof Error ? err.message : String(err));
+    // Hunt 5: same friendly-network-error rule as the request step.
+    showStatus(friendlySignInError(err instanceof Error ? err.message : String(err)));
   }
 }
 
@@ -719,7 +726,9 @@ async function completeGitHubSignIn(callbackUrl: string): Promise<void> {
     githubToken = null;
     githubLogin = null;
     refreshGithubStatus();
-    let message = err instanceof Error ? err.message : String(err);
+    // Hunt 5: a network failure mid-callback gets the same friendly
+    // wording as the device flow; every other message is unchanged.
+    let message = friendlySignInError(err instanceof Error ? err.message : String(err));
     // Hunt 4: the common mobile failure is the missing client secret
     // (the redirect exchange needs one and a phone has none). Point
     // at the sign-in that needs no secret instead of leaving the user
@@ -885,9 +894,10 @@ async function init(): Promise<void> {
   // OAuth callback at startup, and completing it needs the keyring.
   // Load persisted telemetry settings before the panels mount, so the
   // Stats panel renders the stored toggles (not the defaults) on the
-  // first paint. With the memory store this is just the defaults.
-  // The keyring load likewise restores saved accounts (same store).
-  const appInstance = createArkNetzApp();
+  // first paint. IndexedDB stores (hunt 5, P2): mail, drafts, keyring,
+  // telemetry, search, P2P and streaming all persist across reloads —
+  // the panels promise that, and with memory stores none of it did.
+  const appInstance = createArkNetzApp({ useIndexedDB: true });
   app = appInstance;
   await appInstance.loadTelemetrySettings();
   await appInstance.loadP2PSettings();
@@ -1026,6 +1036,10 @@ async function init(): Promise<void> {
   // After a sign-in completes, rebuild the nav (Moderation appears
   // only for the Root Master) and re-render the active panel.
   panelsRefreshNav = panels.refreshNav;
+  // Hunt 5: the top-of-screen dropdown menu (narrow screens only).
+  // initTopMenu is idempotent; the index.html inline script that used
+  // to call it is removed, so main.ts is the single owner.
+  initTopMenu();
 
   ($("go-btn") as HTMLButtonElement).onclick = () => go(($("address-input") as HTMLInputElement).value);
   ($("address-input") as HTMLInputElement).addEventListener("keydown", (e) => {

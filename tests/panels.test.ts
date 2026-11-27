@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { APP_PANELS, createArkNetzApp, panelVisibleForLogin, visiblePanelsForLogin } from "../src/lib/app.js";
 import { MASTER_GITHUB_USER } from "../src/lib/config.js";
 import { createPanelState, renderPanelHtml } from "../src/lib/panels.js";
+import { recordAcceptance } from "../src/lib/network/tos.js";
 import { DEMO_SITE } from "../src/lib/sample.js";
 import type { SiteDocument } from "../src/lib/types.js";
 
@@ -129,6 +130,51 @@ test("panels: moderation hides the admin panel from guests; accounts show the ke
   const accounts = await renderPanelHtml(app, "accounts", state, opts);
   assert.match(accounts, /keyring is locked/);
   assert.match(accounts, /PropTheRtRevDrSirStanleyG05/);
+});
+
+// Hunt 5: the Accept button used to record into a fresh memory store
+// on every render AND every click, so the acceptance never survived
+// a panel switch even within the session. The mount now owns ONE
+// store (state.tosStore); recording into it must show the accepted
+// state on the next render of the same mount.
+test("panels: ToS acceptance survives a panel re-render (shared store)", async () => {
+  const app = createArkNetzApp({ fetchFn: throwingFetch });
+  const state = createPanelState();
+  const before = await renderPanelHtml(app, "accounts", state, opts);
+  assert.match(before, /an-tos-accept-btn/);
+  assert.doesNotMatch(before, /Accepted .* — recorded on this device/);
+  await recordAcceptance(state.tosStore, "guest", "first-sign-in");
+  const after = await renderPanelHtml(app, "accounts", state, opts);
+  assert.doesNotMatch(after, /an-tos-accept-btn/);
+  assert.match(after, /Accepted .* — recorded on this device/);
+});
+
+test("panels: mail compose exposes CC/BCC; accounts sign-in copy describes the device flow", async () => {
+  const app = createArkNetzApp({ fetchFn: throwingFetch });
+  const state = createPanelState();
+  state.mailKeypair = await app.newMailKeypair("alice@computers.edu");
+  state.mailAddress = "alice@computers.edu";
+  const mail = await renderPanelHtml(app, "mail", state, opts);
+  assert.match(mail, /an-mail-cc/);
+  assert.match(mail, /an-mail-bcc/);
+  const accounts = await renderPanelHtml(app, "accounts", state, opts);
+  assert.match(accounts, /device flow/);
+  assert.match(accounts, /github\.com\/device/);
+  // The old copy described the redirect flow as the sign-in
+  // mechanism; device flow has been primary since hunt 4.
+  assert.doesNotMatch(accounts, /GitHub sends the app back to arknetz:\/\/oauth\/callback/);
+});
+
+test("panels: comments panel names the site being read, not the demo", async () => {
+  const app = createArkNetzApp({ fetchFn: throwingFetch });
+  const state = createPanelState();
+  const other: SiteDocument = { ...DEMO_SITE, domain: "cinema.orion", title: "Cinema Orion" };
+  const html = await renderPanelHtml(app, "comments", state, {
+    ...opts,
+    getCurrentDoc: () => JSON.parse(JSON.stringify(other)) as SiteDocument,
+  });
+  assert.match(html, /cinema\.orion/);
+  assert.doesNotMatch(html, /welcome\.arknetz/);
 });
 
 test("panels: wayback and streaming render their honest empty states", async () => {

@@ -94,6 +94,11 @@ test("wayback-ui: 'Failed to fetch' becomes the plain-language unreachable messa
   );
   assert.match(WAYBACK_UNREACHABLE_MESSAGE, /Could not reach archive\.org/);
   assert.match(WAYBACK_UNREACHABLE_MESSAGE, /check your connection and try again/);
+  // Hunt 5 (P1): the lookup now goes through the Rust `wayback_fetch`
+  // command, so a failure genuinely means the network or archive.org
+  // itself — the message must not blame an app-side block any more.
+  assert.match(WAYBACK_UNREACHABLE_MESSAGE, /archive\.org itself may be down/);
+  assert.doesNotMatch(WAYBACK_UNREACHABLE_MESSAGE, /needs an app update to fix/);
 });
 
 test("wayback-ui: HTTP statuses get plain-language explanations, not bare codes", () => {

@@ -15,9 +15,11 @@ import { checkDomainAvailability, normalizeDomain } from "./domains.js";
 import { accountSwitcherPillView, tosAcceptanceView } from "./network/accounts-ui.js";
 import { backendPickerView } from "./network/backends-ui.js";
 import { wireWaybackPanel } from "./network/wayback-ui.js";
+import { waybackFetch } from "./network/wayback.js";
 import { renderBackendsPanelHtml, mountBackendsPanel } from "./network/backends-panel.js";
 import type { BackendPrefix, MirrorAttempt, ProjectFlags } from "./network/backends.js";
 import { createMemoryTosStore, hasAccepted, recordAcceptance, tosAcceptanceStatusLine } from "./network/tos.js";
+import type { TosStore } from "./network/tos.js";
 import { COPY as VIEWER_COPY, commentsPanelView } from "./viewer/viewer-ui.js";
 import {
   OFFLINE_COPY,
@@ -115,10 +117,15 @@ export interface PanelState {
   vault: VaultManager | null;
   /** Files in the vault root, refreshed after open and after each drop. */
   vaultFiles: VaultFile[];
+  /** The ONE ToS acceptance store for this mount (hunt 5): render +
+   *  wire used to create a fresh memory store each — the Accept
+   *  button recorded into a throwaway store, so the acceptance never
+   *  survived a panel switch even within the session. */
+  tosStore: TosStore;
 }
 
 export function createPanelState(): PanelState {
-  return { mailKeypair: null, mailAddress: "", vaultLabel: null, vault: null, vaultFiles: [] };
+  return { mailKeypair: null, mailAddress: "", vaultLabel: null, vault: null, vaultFiles: [], tosStore: createMemoryTosStore() };
 }
 
 function esc(s: string): string {
@@ -213,6 +220,8 @@ export async function renderPanelHtml(
         section(
           "Compose (draft saved locally)",
           `<label>To <input id="an-mail-to" type="text" placeholder="friend@computers.edu"></label>
+           <label>CC <input id="an-mail-cc" type="text" placeholder="teammate@computers.edu (optional, comma-separated)"></label>
+           <label>BCC <input id="an-mail-bcc" type="text" placeholder="quiet@computers.edu (optional, comma-separated)"></label>
            <label>Subject <input id="an-mail-subject" type="text"></label>
            <label>Body <textarea id="an-mail-body" rows="4"></textarea></label>
            <button id="an-mail-draft-btn" type="button">Save draft</button>
@@ -271,15 +280,21 @@ export async function renderPanelHtml(
       );
     }
     case "comments": {
+      // Hunt 5: the thread used to be hardcoded to the demo site, so
+      // the panel always said "0 comments on this page" for the demo
+      // even while reading another site. The counts are still the
+      // demo's honest empty state (no comments mirror is loaded yet),
+      // but the panel now names the site actually being read.
+      const doc = opts.getCurrentDoc();
       const vm = commentsPanelView(
-        { id: "demo", domain: "welcome.arknetz", pagePath: "/", title: "Welcome", locked: false, comments: [], moderationLog: [] },
+        { id: "demo", domain: doc.domain, pagePath: "/", title: doc.title, locked: false, comments: [], moderationLog: [] },
         { viewerLogin: null, siteOwner: MASTER_GITHUB_USER },
       );
       return (
         h +
         note(VIEWER_COPY.commentsGuestRead) +
         `<p>Guests can read: ${vm.canRead ? "yes" : "no"}. Guests can comment: ${vm.canComment ? "yes" : "no"} — ${esc(vm.commentBlockedReason)}</p>
-         <p>${vm.totalCount} comment${vm.totalCount === 1 ? "" : "s"} on this page. Comments live as GitHub Discussions/Issues in the site owner's repo, so posting needs sign-in and a real site repo.</p>`
+         <p>${vm.totalCount} comment${vm.totalCount === 1 ? "" : "s"} on ${esc(vm.domain)} yet. Comments live as GitHub Discussions/Issues in the site owner's repo, so posting needs sign-in and a real site repo.</p>`
       );
     }
     case "streaming": {
@@ -336,8 +351,7 @@ export async function renderPanelHtml(
     }
     case "accounts": {
       const pill = accountSwitcherPillView(app.keyring.snapshot(), app.keyring.isMasterAdmin());
-      const tosStore = createMemoryTosStore();
-      const accepted = await hasAccepted(tosStore, "guest");
+      const accepted = await hasAccepted(state.tosStore, "guest");
       const tosVm = tosAcceptanceView(accepted);
       const activeGithub = app.keyring.getActive("github");
       const githubStatus = activeGithub
@@ -347,9 +361,9 @@ export async function renderPanelHtml(
         h +
         section("Accounts", `<p>${esc(pill.pillLabel)} — ${pill.signedInCount} account${pill.signedInCount === 1 ? "" : "s"} signed in. ${pill.masterBadgeVisible ? esc(pill.masterBadgeLabel) : "Root Master controls appear only when the active GitHub account is " + MASTER_GITHUB_USER + "."}</p>
          <p class="an-note">The keyring ${app.keyring.isUnlocked ? "is unlocked" : "is locked"} — profiles are encrypted in IndexedDB under your passphrase. One-click switching across gh:/gl:/cb:/ia:/hf:/wm: needs linked accounts; ${pill.signedInCount === 0 ? "none are linked yet." : "switch from the pill in the top bar."}</p>`) +
-        section("GitHub sign-in", `<p>${esc(githubStatus)}</p><p class="an-note">Sign-in runs the real GitHub OAuth flow: the app opens github.com, GitHub sends the app back to arknetz://oauth/callback, and the code is exchanged for a token inside the Tauri shell — the client secret never enters the app. The signed-in account joins the keyring above like any other backend account.</p><button id="an-github-signin-btn" type="button">Sign in with GitHub</button><div id="an-github-signin-status" role="status"></div>`) +
+        section("GitHub sign-in", `<p>${esc(githubStatus)}</p><p class="an-note">Sign-in uses GitHub's device flow: the app shows you a short code, you enter it at github.com/device in your browser, and GitHub sends the app a token directly — no client secret lives on the device, and nothing needs to redirect back. If Device Flow is not enabled on the OAuth App yet, the app says so exactly and offers the redirect sign-in as a fallback. The signed-in account joins the keyring above like any other backend account.</p><button id="an-github-signin-btn" type="button">Sign in with GitHub</button><div id="an-github-signin-status" role="status"></div>`) +
         section("Keyring", `<p class="an-note">The keyring holds every backend account's token, encrypted under one vault passphrase. It must be unlocked before a signed-in account can be saved — a GitHub sign-in while it is locked works for this session only. ${app.keyring.isUnlocked ? "Unlocked." : "Locked."}</p><label>Vault passphrase <input id="an-keyring-pass" type="password" autocomplete="current-password"></label> <button id="an-keyring-unlock-btn" type="button">Unlock keyring</button> <button id="an-keyring-lock-btn" type="button">Lock keyring</button><div id="an-keyring-status" role="status"></div>`) +
-        section("Acceptable Use", `<p>${esc(tosVm.note)}</p><button id="an-tos-accept-btn" type="button">${esc(tosVm.label)}</button><div id="an-tos-status" role="status"></div>`)
+        section("Acceptable Use", `<p>${esc(tosVm.note)}</p>${tosVm.accepted ? `<p>Accepted ${esc(tosVm.acceptedAtDisplay ?? tosVm.acceptedAt ?? "")} — recorded on this device.</p>` : `<button id="an-tos-accept-btn" type="button">${esc(tosVm.label)}</button>`}<div id="an-tos-status" role="status"></div>`)
       );
     }
     case "wayback": {
@@ -379,10 +393,18 @@ export async function renderPanelHtml(
       return renderCallsPanelHtml(controller.viewModel());
     }
     case "settings":
-      return h + note("Internet Archive and GitHub settings live in the sidebar on the left — link IA keys there to enable stealth upload, and sign in with GitHub to enable Publish.");
+      return h + note("Internet Archive and GitHub settings live in the sidebar — below the reader on a phone — link IA keys there to enable stealth upload, and sign in with GitHub to enable Publish.");
     default:
       return h + note("This panel is registered but has no renderer yet.");
   }
+}
+
+/** Split a comma-separated CC/BCC field into clean addresses. */
+function splitMailAddresses(value: string): string[] {
+  return value
+    .split(",")
+    .map((a) => a.trim())
+    .filter((a) => a.length > 0);
 }
 
 /** Wire a rendered panel's buttons. Called by mountPanels after render. */
@@ -455,10 +477,12 @@ export async function wirePanel(
     });
     $("an-mail-draft-btn")?.addEventListener("click", () => {
       const to = ($("an-mail-to") as HTMLInputElement | null)?.value.trim() ?? "";
+      const cc = splitMailAddresses(($("an-mail-cc") as HTMLInputElement | null)?.value ?? "");
+      const bcc = splitMailAddresses(($("an-mail-bcc") as HTMLInputElement | null)?.value ?? "");
       const subject = ($("an-mail-subject") as HTMLInputElement | null)?.value ?? "";
       const body = ($("an-mail-body") as HTMLTextAreaElement | null)?.value ?? "";
       const status = $("an-mail-draft-status");
-      const draft = { ...newDraft(state.mailAddress), to: [to], subject, body };
+      const draft = { ...newDraft(state.mailAddress), to: to ? [to] : [], cc, bcc, subject, body };
       const problems = validateDraft(draft);
       if (problems.length) {
         if (status) status.textContent = problems.join(" ");
@@ -475,15 +499,22 @@ export async function wirePanel(
     // instead of pretending to send.
     $("an-mail-send-btn")?.addEventListener("click", () => {
       const to = ($("an-mail-to") as HTMLInputElement | null)?.value.trim() ?? "";
+      const cc = splitMailAddresses(($("an-mail-cc") as HTMLInputElement | null)?.value ?? "");
+      const bcc = splitMailAddresses(($("an-mail-bcc") as HTMLInputElement | null)?.value ?? "");
       const subject = ($("an-mail-subject") as HTMLInputElement | null)?.value ?? "";
       const body = ($("an-mail-body") as HTMLTextAreaElement | null)?.value ?? "";
       const status = $("an-mail-draft-status");
-      const draft: MailDraft = { ...newDraft(state.mailAddress), to: [to], subject, body };
+      const draft: MailDraft = { ...newDraft(state.mailAddress), to: to ? [to] : [], cc, bcc, subject, body };
       const problems = validateDraft(draft);
       if (problems.length) {
         if (status) status.textContent = problems.join(" ");
         return;
       }
+      // Hunt 5: the panel promises the draft still saves locally when
+      // sending refuses — so save it first, best-effort, before any
+      // refusal path below (the old code claimed the save without
+      // doing it).
+      void saveDraft(app.draftStore, draft).catch(() => undefined);
       const keypair = state.mailKeypair;
       if (!keypair) return;
       if (!opts.onSendMail) {
@@ -657,9 +688,13 @@ export async function wirePanel(
   if (panelId === "accounts") {
     $("an-tos-accept-btn")?.addEventListener("click", () => {
       const status = $("an-tos-status");
-      const store = createMemoryTosStore();
-      void recordAcceptance(store, "guest", "first-sign-in").then((a) => {
+      // Hunt 5: record into the mount's SHARED store (state.tosStore),
+      // not a fresh one — the old handler recorded into a throwaway
+      // store, so the acceptance vanished on the next panel switch.
+      // Re-render so the section flips to its accepted state at once.
+      void recordAcceptance(state.tosStore, "guest", "first-sign-in").then((a) => {
         if (status) status.textContent = tosAcceptanceStatusLine(a);
+        rerender();
       }).catch((e) => {
         if (status) status.textContent = e instanceof Error ? e.message : String(e);
       });
@@ -688,7 +723,10 @@ export async function wirePanel(
     });
   }
   if (panelId === "wayback") {
-    wireWaybackPanel(root, fetchFn);
+    // Hunt 5 (P1): the Time Machine lookup must go through the Rust
+    // `wayback_fetch` command — web.archive.org sends no CORS headers,
+    // so a plain window.fetch is blocked in the WebView.
+    wireWaybackPanel(root, waybackFetch);
   }
   if (panelId === "stats") {
     const deps = statsDeps(opts);
