@@ -3145,3 +3145,62 @@ reload; a Time Machine lookup against real archive.org; a live
 domain claim; any live GitHub/IA round-trip; a two-device call; APK
 install of a build containing these fixes (none built here — no
 `tauri build` was run).
+
+## Release v0.5.1 — build (2026-11-28)
+
+- Version bump 0.5.0 → 0.5.1 (patch: bug hunt 5 fixes). Updated in
+  package.json (version + description), src-tauri/tauri.conf.json,
+  src-tauri/Cargo.toml, src/index.html footer, tests/app.test.ts
+  (version test). Android versionName 0.5.1 / versionCode 5001 via
+  src-tauri/gen/android/app/tauri.properties (local-only generated
+  file, not tracked in the repo — confirmed 404 on raw; set by hand
+  before the Android build, verified on the built APK).
+- Bump commit (live): `3079bd0a4a904f81432f4e6e70028ed0c18f8ee5`
+  ("v0.5.1: version bump (bug hunt 5: device-flow sign-in via Rust,
+  dropdown topbar, sweep fixes)"). Battery after the bump: 830
+  pass, 0 fail. All four artifacts are built FROM this commit.
+- Build environment (VM reset since 0.5.0): libzstd1 had returned
+  to the Hatch-patched build — downgraded to stock
+  1.5.5+dfsg2-2build1.1 FIRST, then reinstalled the Tauri -dev
+  packages (libwebkit2gtk-4.1-dev 2.52.6, libgtk-3-dev 3.24.41,
+  libayatana-appindicator3-dev 0.5.93, librsvg2-dev 2.58.0, +
+  libssl-dev, build-essential, pkg-config, libxdo-dev); apt update
+  took ~10 min through the slow egress proxy. Egress CA in the JDK
+  trust store was still current (F9:32:CD:41…, verified before the
+  Android build — no re-import needed). Gradle proxy props
+  rewritten from the current env before the Android build
+  (~/.gradle/gradle.properties; token rotates per shell).
+- Artifacts (staged in ~/workspace/arknetzwebweaver/release-0.5.1/,
+  SHA256SUMS.txt re-verified OK):
+  - ArkNetzWebWeaver_0.5.1_amd64.AppImage — 84,179,448 bytes,
+    SHA-256 b6fd3533bcb91a2ed7c263054184baed981789b1b6d31c25c9b7bc733893108b
+    (extraction-verified only — no /dev/fuse in this VM; extracted
+    binary is ELF 64-bit x86-64).
+  - ArkNetzWebWeaver_0.5.1_amd64.deb — 5,637,428 bytes,
+    SHA-256 4e553099d3fb74d225a3af004cede5342268ad05cd21ac6c976610cfd92001a0
+  - ArkNetzWebWeaver-0.5.1.exe — 11,119,104 bytes,
+    SHA-256 e3a379c6b191f027bb4b006349147e7ed5da4a7824d12e573e342bae504365cc
+    (PE32+ x86-64, 9 sections; cargo-xwin 0.23.1, 4m53s, one benign
+    LNK4099 debug-info warning; Wine smoke test: loads, reaches
+    Tauri setup, panics at app.rs:1444 "failed to create window" —
+    no X server, same as 0.4.0/0.5.0, not a bad binary).
+  - ArkNetzWebWeaver-0.5.1.apk — 14,084,450 bytes,
+    SHA-256 410971c632548440a4f178ee5e7c47f62e2f535de95c295a6d215d367001429e
+    (aapt2: package com.stanbeyond.arknetzwebweaver, versionCode
+    5001, versionName 0.5.1, minSdk 24, targetSdk 36; apksigner
+    verifies, v2 true, v3 true, v1 false — known quirk; signer cert
+    SHA-256 5cc87c8a…c0c7 IDENTICAL to the v0.5.0 APK's cert, so
+    updates install over 0.5.0).
+- Signing notes: apksigner's `file:` password form fails on this
+  keystore ("Failed to read Key password: end of file reached") —
+  use the `env:` form with an exported variable instead (password
+  read from release-signing/KEYSTORE-PASSWORDS.txt, never printed,
+  unset right after; the temp password file was shredded).
+  The unsigned APK was built by `tauri android build --apk
+  --target aarch64` (8m55s, one pre-existing `let mut builder`
+  warning in lib.rs).
+- No GitHub Release created (parent's job via the browser). No
+  release was created, keystore untouched, no .github/workflows
+  file touched. The v0.5.0 caveats carry over: .exe Wine-tested
+  only, APK never installed on a real device, no live OAuth/mail/IA
+  verification, real WebRTC untested.
